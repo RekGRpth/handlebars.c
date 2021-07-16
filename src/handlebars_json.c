@@ -304,14 +304,10 @@ void handlebars_value_init_json_object(struct handlebars_context * ctx, struct h
 
         case json_type_object:
         case json_type_array:
-            // Increment refcount
-            json_object_get(json);
-
             obj = handlebars_talloc(ctx, struct handlebars_json);
             HANDLEBARS_MEMCHECK(obj, ctx);
             handlebars_user_init((struct handlebars_user *) obj, ctx, &handlebars_value_hbs_json_handlers);
             obj->object = json;
-            talloc_set_destructor(obj, handlebars_json_dtor);
             handlebars_value_user(value, (struct handlebars_user *) obj);
             break;
 
@@ -324,8 +320,11 @@ void handlebars_value_init_json_string(struct handlebars_context *ctx, struct ha
     enum json_tokener_error parse_err = json_tokener_success;
     struct json_object * result = json_tokener_parse_verbose(json, &parse_err);
     if( parse_err == json_tokener_success ) {
+        struct handlebars_json *obj = handlebars_talloc(ctx, struct handlebars_json);;
+        HANDLEBARS_MEMCHECK(obj, ctx);
+        obj->object = result;
+        talloc_set_destructor(obj, handlebars_json_dtor);
         handlebars_value_init_json_object(ctx, value, result);
-        json_object_put(result);
     } else {
         handlebars_throw(ctx, HANDLEBARS_ERROR, "JSON Parse error: %s", json_tokener_error_desc(parse_err));
     }
