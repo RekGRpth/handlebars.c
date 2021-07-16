@@ -100,32 +100,30 @@ static struct handlebars_value * hbs_partial_loader_map_find(struct handlebars_v
     }
 
     FILE * f;
-    long size;
+    long size = 0;
+    char * buf = (char *)"";
 
     f = fopen(hbs_str_val(filename), "rb");
-    if( !f ) {
-        handlebars_throw(intern->user.ctx, HANDLEBARS_ERROR, "File to open partial: %.*s", (int) hbs_str_len(filename), hbs_str_val(filename));
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+
+        buf = handlebars_talloc_array(intern->user.ctx, char, size + 1);
+        size_t read = fread(buf, size, 1, f);
+        fclose(f);
+
+        if (!read) {
+            handlebars_throw(intern->user.ctx, HANDLEBARS_ERROR, "Failed to read partial: %.*s", (int) hbs_str_len(filename), hbs_str_val(filename));
+        }
+
+        buf[size] = 0;
     }
-
-    fseek(f, 0, SEEK_END);
-    size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    char * buf = handlebars_talloc_array(intern->user.ctx, char, size + 1);
-    size_t read = fread(buf, size, 1, f);
-    fclose(f);
-
-    if (!read) {
-        handlebars_throw(intern->user.ctx, HANDLEBARS_ERROR, "Failed to read partial: %.*s", (int) hbs_str_len(filename), hbs_str_val(filename));
-    }
-
-    buf[size] = 0;
-
     // Need to duplicate the key because it may be owned by a child VM
     key = handlebars_string_copy_ctor(intern->user.ctx, key);
 
     handlebars_value_str(rv, handlebars_string_ctor(intern->user.ctx, buf, size));
-    handlebars_talloc_free(buf);
+    if (f) handlebars_talloc_free(buf);
 
     intern->map = handlebars_map_add(intern->map, key, rv);
 
