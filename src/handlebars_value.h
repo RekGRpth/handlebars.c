@@ -185,7 +185,7 @@ extern const size_t HANDLEBARS_VALUE_INTERNALS_SIZE;
  */
 struct handlebars_value * handlebars_value_ctor(
     struct handlebars_context * ctx
-) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT HBS_ATTR_DEPRECATED;
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
 
 /**
  * @brief Destruct a value. Does not free the value object itself. Frees any child resources and sets the value to null.
