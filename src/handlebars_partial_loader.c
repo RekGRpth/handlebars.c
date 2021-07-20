@@ -95,15 +95,16 @@ static struct handlebars_value * hbs_partial_loader_map_find(struct handlebars_v
     struct handlebars_string *filename = handlebars_string_copy_ctor(intern->user.ctx, intern->base_path);
     filename = handlebars_string_append(intern->user.ctx, filename, HBS_STRL("/"));
     filename = handlebars_string_append_str(intern->user.ctx, filename, key);
-    if (intern->extension) {
-        filename = handlebars_string_append_str(intern->user.ctx, filename, intern->extension);
-    }
 
     FILE * f;
     long size = 0;
     char * buf = (char *)"";
 
     f = fopen(hbs_str_val(filename), "rb");
+    if (!f) {
+        filename = handlebars_string_append_str(intern->user.ctx, filename, intern->extension);
+        f = fopen(hbs_str_val(filename), "rb");
+    }
     if (f) {
         fseek(f, 0, SEEK_END);
         size = ftell(f);
