@@ -16,7 +16,7 @@ jobs:
         - name: Checkout submodules
           uses: textbook/git-checkout-submodule-action@master
         - name: Publish to Docker Hub
-          uses: docker/build-push-action@v3.1.0
+          uses: docker/build-push-action@v3.1.1
           with:
             dockerfile: .github/alpine.Dockerfile
             username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -26,7 +26,7 @@ jobs:
             tag_with_sha: true
             add_git_labels: true
         - name: Publish to GitHub Packages
-          uses: docker/build-push-action@v3.1.0
+          uses: docker/build-push-action@v3.1.1
           with:
             dockerfile: .github/alpine.Dockerfile
             username: ${{ secrets.GH_PKG_USERNAME }}
@@ -43,7 +43,7 @@ jobs:
         - name: Checkout submodules
           uses: textbook/git-checkout-submodule-action@master
         - name: Publish to Docker Hub
-          uses: docker/build-push-action@v3.1.0
+          uses: docker/build-push-action@v3.1.1
           with:
             dockerfile: .github/debian.Dockerfile
             username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -54,7 +54,7 @@ jobs:
             add_git_labels: true
             tags: debian
         - name: Publish to GitHub Packages
-          uses: docker/build-push-action@v3.1.0
+          uses: docker/build-push-action@v3.1.1
           with:
             dockerfile: .github/debian.Dockerfile
             username: ${{ secrets.GH_PKG_USERNAME }}
@@ -72,7 +72,7 @@ jobs:
         - name: Checkout submodules
           uses: textbook/git-checkout-submodule-action@master
         - name: Publish to Docker Hub
-          uses: docker/build-push-action@v3.1.0
+          uses: docker/build-push-action@v3.1.1
           with:
             dockerfile: .github/fedora.Dockerfile
             username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -83,7 +83,7 @@ jobs:
             add_git_labels: true
             tags: fedora
         - name: Publish to GitHub Packages
-          uses: docker/build-push-action@v3.1.0
+          uses: docker/build-push-action@v3.1.1
           with:
             dockerfile: .github/fedora.Dockerfile
             username: ${{ secrets.GH_PKG_USERNAME }}
