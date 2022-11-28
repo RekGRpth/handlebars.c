@@ -1,8 +1,6 @@
 # handlebars.c
 
-[![Build Status](https://travis-ci.com/jbboehr/handlebars.c.svg?branch=master)](https://travis-ci.com/jbboehr/handlebars.c)
-[![Linux Build Status](https://github.com/jbboehr/handlebars.c/workflows/linux/badge.svg)](https://github.com/jbboehr/handlebars.c/actions?query=workflow%3Alinux)
-[![OSX Build Status](https://github.com/jbboehr/handlebars.c/workflows/osx/badge.svg)](https://github.com/jbboehr/handlebars.c/actions?query=workflow%3Aosx)
+[![GitHub Build Status](https://github.com/jbboehr/handlebars.c/workflows/ci/badge.svg)](https://github.com/jbboehr/handlebars.c/actions?query=workflow%3Aci)
 [![Coverage Status](https://coveralls.io/repos/jbboehr/handlebars.c/badge.svg?branch=master&service=github)](https://coveralls.io/github/jbboehr/handlebars.c?branch=master)
 [![License](https://img.shields.io/badge/license-LGPLv2.1-brightgreen.svg)](LICENSE.md)
 
@@ -19,16 +17,22 @@ partials.
 ### Nix / NixOS
 
 ```bash
-nix-env -i -f https://github.com/jbboehr/handlebars.c/archive/v0.7.2.tar.gz
+nix-env -i -f https://github.com/jbboehr/handlebars.c/archive/v1.0.0.tar.gz
 ```
 
 or, in a `.nix` file:
 
 ```nix
 (import <nixpkgs> {}).callPackage (import (fetchTarball {
-  url = https://github.com/jbboehr/handlebars.c/archive/v0.7.2.tar.gz;
-  sha256 = "1rszprra8pavsw7aq7ixdn3jd00zy3hymmh2z4wcqc9lrw3h6hxb";
+  url = https://github.com/jbboehr/handlebars.c/archive/v1.0.0.tar.gz;
+  sha256 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 })) {}
+```
+
+or, to run as a flake:
+
+```bash
+nix run github:jbboehr/handlebars.c
 ```
 
 ### Alpine Linux

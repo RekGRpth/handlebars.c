@@ -3,7 +3,6 @@ let
     pkgs.callPackage ../default.nix (args // {
       inherit stdenv;
       WerrorSupport = true;
-      check = pkgs.callPackage ./check.nix {};
     });
 
   generateHandlebarsCTestsForPlatform2 = { pkgs, ... }@args:
@@ -19,8 +18,8 @@ in
 builtins.mapAttrs (k: _v:
   let
     path = builtins.fetchTarball {
-      url = https://github.com/NixOS/nixpkgs/archive/nixos-20.09.tar.gz;
-      name = "nixos-20.09";
+      url = https://github.com/NixOS/nixpkgs/archive/nixos-22.05.tar.gz;
+      name = "nixos-22.05";
     };
     pkgs = import (path) { system = k; };
     generateHandlebarsCTestsForPlatform3 = { ... }@args:
@@ -35,12 +34,12 @@ builtins.mapAttrs (k: _v:
     };
 
     # 32bit (gcc only)
-    i686 = pkgs.recurseIntoAttrs {
-      gcc = generateHandlebarsCTestsForPlatform {
-        pkgs = pkgs.pkgsi686Linux;
-        stdenv = pkgs.pkgsi686Linux.stdenv;
-      };
-    };
+    # i686 = pkgs.recurseIntoAttrs {
+    #   gcc = generateHandlebarsCTestsForPlatform {
+    #     pkgs = pkgs.pkgsi686Linux;
+    #     stdenv = pkgs.pkgsi686Linux.stdenv;
+    #   };
+    # };
 
     # refcounting disabled
     norc = generateHandlebarsCTestsForPlatform3 {
