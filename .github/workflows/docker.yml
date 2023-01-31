@@ -20,7 +20,7 @@ jobs:
                   username: ${{ secrets.DOCKER_HUB_USERNAME }}
                   password: ${{ secrets.DOCKER_HUB_TOKEN }}
             - name: Publish to Docker Hub
-              uses: docker/build-push-action@v3
+              uses: docker/build-push-action@v4
               with:
                   file: .github/alpine.Dockerfile
                   push: true
@@ -40,7 +40,7 @@ jobs:
                 username: ${{ github.repository_owner }}
                 password: ${{ secrets.GITHUB_TOKEN }}
             - name: Publish to GitHub Packages
-              uses: docker/build-push-action@v3
+              uses: docker/build-push-action@v4
               with:
                   file: .github/alpine.Dockerfile
                   push: true
@@ -59,7 +59,7 @@ jobs:
                   username: ${{ secrets.DOCKER_HUB_USERNAME }}
                   password: ${{ secrets.DOCKER_HUB_TOKEN }}
             - name: Publish to Docker Hub
-              uses: docker/build-push-action@v3
+              uses: docker/build-push-action@v4
               with:
                   file: .github/debian.Dockerfile
                   push: true
@@ -77,7 +77,7 @@ jobs:
                 username: ${{ github.repository_owner }}
                 password: ${{ secrets.GITHUB_TOKEN }}
             - name: Publish to GitHub Packages
-              uses: docker/build-push-action@v3
+              uses: docker/build-push-action@v4
               with:
                   file: .github/debian.Dockerfile
                   push: true
@@ -94,7 +94,7 @@ jobs:
                   username: ${{ secrets.DOCKER_HUB_USERNAME }}
                   password: ${{ secrets.DOCKER_HUB_TOKEN }}
             - name: Publish to Docker Hub
-              uses: docker/build-push-action@v3
+              uses: docker/build-push-action@v4
               with:
                   file: .github/fedora.Dockerfile
                   push: true
@@ -112,7 +112,7 @@ jobs:
                 username: ${{ github.repository_owner }}
                 password: ${{ secrets.GITHUB_TOKEN }}
             - name: Publish to GitHub Packages
-              uses: docker/build-push-action@v3
+              uses: docker/build-push-action@v4
               with:
                   file: .github/fedora.Dockerfile
                   push: true
