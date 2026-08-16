@@ -100,8 +100,8 @@ load "../vendor/bats-assert/assert"
     local empty_file=$(mktemp)
     run $HANDLEBARSC --lex $empty_file
     rm $empty_file
-    assert_failure
-    assert_output --partial "Failed to read file"
+    assert_success
+    assert_output ""
 }
 
 @test "--lex --template <TEMPLATE>" {
@@ -249,6 +249,12 @@ load "../vendor/bats-assert/assert"
     assert_output --partial "Failed to open file"
 }
 
+@test "--execute (directory)" {
+    run $HANDLEBARSC --execute $TEST_DIR
+    assert_failure
+    assert_output --partial "Input is not a regular file"
+}
+
 @test "--execute (no file)" {
     run $HANDLEBARSC --execute
     assert_failure
@@ -259,8 +265,8 @@ load "../vendor/bats-assert/assert"
     local empty_file=$(mktemp)
     run $HANDLEBARSC --execute $empty_file
     rm $empty_file
-    assert_failure
-    assert_output --partial "Failed to read file"
+    assert_success
+    assert_output ""
 }
 
 @test "--execute (is default mode)" {
@@ -288,6 +294,30 @@ load "../vendor/bats-assert/assert"
     run $HANDLEBARSC --execute --flags strict $TEMPLATE
     assert_failure
     assert_output --partial '"foo" not defined in object'
+}
+
+@test "--execute bare @partial-block" {
+    run bash -c "printf '%s' '{{@partial-block}}' | $HANDLEBARSC --execute -"
+    assert_success
+    assert_output ""
+}
+
+@test "--execute bare @partial-block (strict)" {
+    run bash -c "printf '%s' '{{@partial-block}}' | $HANDLEBARSC --execute --flags strict -"
+    assert_failure
+    assert_output --partial '"partial-block" not defined in object'
+}
+
+@test "--execute empty trimmed block preserves whitespace semantics" {
+    run bash -c "printf '%s' 'A  {{~#each x~}}{{/each}}  B' | $HANDLEBARSC --execute -"
+    assert_success
+    assert_output "A  B"
+}
+
+@test "--execute empty right-trimmed block preserves whitespace semantics" {
+    run bash -c "printf '%s' 'A  {{#each x~}}{{/each}}  B' | $HANDLEBARSC --execute -"
+    assert_success
+    assert_output "A    B"
 }
 
 @test "--execute -n" {

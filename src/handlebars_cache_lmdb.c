@@ -20,6 +20,7 @@
 #endif
 
 #include <assert.h>
+#include <string.h>
 #include <time.h>
 
 #ifdef HANDLEBARS_HAVE_LMDB
@@ -40,11 +41,17 @@
 
 
 
-#define HANDLE_RC(err) if( err != 0 && err != MDB_NOTFOUND ) handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "%s", mdb_strerror(err));
+#define HANDLE_RC(err) if( unlikely((err) != 0 && (err) != MDB_NOTFOUND) ) handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "%s", mdb_strerror(err));
 
 struct handlebars_cache_lmdb {
     MDB_env * env;
     struct handlebars_cache_stat stat;
+};
+
+enum cache_copy_module_result {
+    cache_copy_module_valid,
+    cache_copy_module_invalid,
+    cache_copy_module_nomem
 };
 
 
@@ -61,6 +68,47 @@ static int cache_dtor(struct handlebars_cache * cache)
     return 0;
 }
 
+static enum cache_copy_module_result cache_copy_module(
+    struct handlebars_cache * cache,
+    const MDB_val * data,
+    struct handlebars_module ** result
+) {
+    struct handlebars_module * module;
+    size_t module_size;
+
+    *result = NULL;
+
+    if( unlikely(data->mv_size < sizeof(struct handlebars_module)) ) {
+        return cache_copy_module_invalid;
+    }
+
+    /* LMDB only promises byte-addressable value storage. Read the claimed
+     * size without first casting the database memory to an aligned module. */
+    memcpy(
+        &module_size,
+        (const unsigned char *) data->mv_data + offsetof(struct handlebars_module, size),
+        sizeof(module_size)
+    );
+    if( unlikely(module_size != data->mv_size) ) {
+        return cache_copy_module_invalid;
+    }
+
+    module = handlebars_talloc_size(cache, module_size);
+    if( unlikely(module == NULL) ) {
+        return cache_copy_module_nomem;
+    }
+    talloc_set_type(module, struct handlebars_module);
+    memcpy(module, data->mv_data, module_size);
+
+    if( unlikely(!handlebars_module_verify_ex(module, module_size, NULL)) ) {
+        handlebars_talloc_free(module);
+        return cache_copy_module_invalid;
+    }
+
+    *result = module;
+    return cache_copy_module_valid;
+}
+
 static int cache_gc(struct handlebars_cache * cache)
 {
     struct handlebars_cache_lmdb * intern = (struct handlebars_cache_lmdb *) cache->internal;
@@ -69,8 +117,9 @@ static int cache_gc(struct handlebars_cache * cache)
     MDB_dbi dbi;
     MDB_val key;
     MDB_val data;
-    MDB_cursor *cursor;
+    MDB_cursor *cursor = NULL;
     MDB_stat stat;
+    int removed = 0;
     time_t now;
 
     time(&now);
@@ -79,29 +128,61 @@ static int cache_gc(struct handlebars_cache * cache)
     HANDLE_RC(err);
 
     err = mdb_dbi_open(txn, NULL, MDB_CREATE, &dbi);
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
     err = mdb_stat(txn, dbi, &stat);
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
     err = mdb_cursor_open(txn, dbi, &cursor);
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
     while( (err = mdb_cursor_get(cursor, &key, &data, MDB_NEXT)) == 0 ) {
         /* fprintf(stderr, "key: %p %.*s, data: %p %.*s\n",
                 key.mv_data,  (int) key.mv_size,  (char *) key.mv_data,
                 data.mv_data, (int) data.mv_size, (char *) data.mv_data); */
 
-        struct handlebars_module * module = (struct handlebars_module *) data.mv_data;
-        if( cache->max_age >= 0 && difftime(now, module->ts) > cache->max_age ) {
-            mdb_del(txn, dbi, &key, NULL);
+        struct handlebars_module * module;
+        enum cache_copy_module_result copy_result = cache_copy_module(cache, &data, &module);
+        if( unlikely(copy_result == cache_copy_module_nomem) ) {
+            goto nomem;
         }
+        if( copy_result == cache_copy_module_invalid
+                || (cache->max_age >= 0 && difftime(now, module->ts) >= cache->max_age) ) {
+            err = mdb_cursor_del(cursor, 0);
+            if( unlikely(err != 0) ) {
+                handlebars_talloc_free(module);
+                break;
+            }
+            removed++;
+        }
+        handlebars_talloc_free(module);
+    }
+
+    if( err == MDB_NOTFOUND ) {
+        err = 0;
+    }
+    if( unlikely(err != 0) ) {
+        goto error;
     }
 
     mdb_cursor_close(cursor);
-error:
+    cursor = NULL;
+    err = mdb_txn_commit(txn);
     HANDLE_RC(err);
+    return removed;
+
+error:
+    if( cursor != NULL ) {
+        mdb_cursor_close(cursor);
+    }
     mdb_txn_abort(txn);
+    HANDLE_RC(err);
+    return 0;
+
+nomem:
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+    handlebars_throw(CONTEXT, HANDLEBARS_NOMEM, HANDLEBARS_MEMCHECK_MSG);
     return 0;
 }
 
@@ -113,28 +194,26 @@ static struct handlebars_module * cache_find(struct handlebars_cache * cache, st
     MDB_dbi dbi;
     MDB_val key;
     MDB_val data;
-    char tmp[256];
-    struct handlebars_module * module;
+    struct handlebars_module * module = NULL;
+    enum cache_copy_module_result copy_result;
     time_t now;
-    size_t size;
 
     time(&now);
+
+    if( unlikely(hbs_str_len(tmpl) >= (size_t) mdb_env_get_maxkeysize(intern->env)) ) {
+        intern->stat.misses++;
+        return NULL;
+    }
 
     err = mdb_txn_begin(intern->env, NULL, MDB_RDONLY, &txn);
     HANDLE_RC(err);
 
     err = mdb_dbi_open(txn, NULL, MDB_CREATE, &dbi);
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
     // Make key
-    if( hbs_str_len(tmpl) > (size_t) mdb_env_get_maxkeysize(intern->env) ) {
-        snprintf(tmp, 256, "hash:%lu", (unsigned long) hbs_str_hash(tmpl));
-        key.mv_size = strlen(tmp);
-        key.mv_data = tmp;
-    } else {
-        key.mv_size = hbs_str_len(tmpl) + 1;
-        key.mv_data = hbs_str_val(tmpl);
-    }
+    key.mv_size = hbs_str_len(tmpl) + 1;
+    key.mv_data = hbs_str_val(tmpl);
 
     // Fetch data
     err = mdb_get(txn, dbi, &key, &data);
@@ -143,20 +222,16 @@ static struct handlebars_module * cache_find(struct handlebars_cache * cache, st
         mdb_txn_abort(txn);
         return NULL;
     }
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
-    module = ((struct handlebars_module *) data.mv_data);
-
-#if defined(HANDLEBARS_ENABLE_DEBUG)
-    // In debug mode, throw
-    handlebars_module_verify(module, CONTEXT);
-#else
-    // In release mode, consider a failed hash/version match a miss
-    if (!handlebars_module_verify(module, NULL)) {
+    copy_result = cache_copy_module(cache, &data, &module);
+    if( unlikely(copy_result == cache_copy_module_nomem) ) {
+        goto nomem;
+    }
+    if( unlikely(copy_result == cache_copy_module_invalid) ) {
         intern->stat.misses++;
         goto error;
     }
-#endif
 
     // Check if it's too old
     if (cache->max_age >= 0 && difftime(now, module->ts) >= cache->max_age) {
@@ -165,12 +240,6 @@ static struct handlebars_module * cache_find(struct handlebars_cache * cache, st
     }
 
     intern->stat.hits++;
-
-    // Duplicate data
-    size = module->size;
-    module = handlebars_talloc_size(cache, size);
-    talloc_set_type(module, struct handlebars_module);
-    memcpy(module, data.mv_data, size);
 
     // Close
     mdb_txn_abort(txn);
@@ -182,7 +251,13 @@ static struct handlebars_module * cache_find(struct handlebars_cache * cache, st
 
 error:
     mdb_txn_abort(txn);
+    handlebars_talloc_free(module);
     HANDLE_RC(err);
+    return NULL;
+
+nomem:
+    mdb_txn_abort(txn);
+    handlebars_throw(CONTEXT, HANDLEBARS_NOMEM, HANDLEBARS_MEMCHECK_MSG);
     return NULL;
 }
 
@@ -197,32 +272,36 @@ static void cache_add(
     MDB_dbi dbi;
     MDB_val key;
     MDB_val data;
-    char tmp[256];
     struct handlebars_module * module_copy;
 
-    err = mdb_txn_begin(intern->env, NULL, 0, &txn);
-    HANDLE_RC(err);
-
-    err = mdb_dbi_open(txn, NULL, MDB_CREATE, &dbi);
-    if( err != 0 ) goto error;
-
-    // Make key
-    if( hbs_str_len(tmpl) > (size_t) mdb_env_get_maxkeysize(intern->env) ) {
-        snprintf(tmp, 256, "hash:%lu", (unsigned long) hbs_str_hash(tmpl));
-        key.mv_size = strlen(tmp);
-        key.mv_data = tmp;
-    } else {
-        key.mv_size = hbs_str_len(tmpl) + 1;
-        key.mv_data = hbs_str_val(tmpl);
+    // LMDB cannot store keys beyond this limit. Do not reduce long templates
+    // to a non-unique hash key, since that can return another template's module.
+    if( unlikely(hbs_str_len(tmpl) >= (size_t) mdb_env_get_maxkeysize(intern->env)) ) {
+        return;
     }
 
-    // Normalize pointers
+    // Normalize a private copy before taking the LMDB write lock.
     module_copy = handlebars_talloc_size(CONTEXT, module->size);
+    HANDLEBARS_MEMCHECK(module_copy, CONTEXT);
     talloc_set_type(module_copy, struct handlebars_module);
     memcpy(module_copy, module, module->size);
     handlebars_module_patch_pointers(module_copy);
     handlebars_module_normalize_pointers(module_copy, (void *) 0);
     handlebars_module_generate_hash(module_copy);
+
+    err = mdb_txn_begin(intern->env, NULL, 0, &txn);
+    if( unlikely(err != 0) ) {
+        handlebars_talloc_free(module_copy);
+        HANDLE_RC(err);
+        return;
+    }
+
+    err = mdb_dbi_open(txn, NULL, MDB_CREATE, &dbi);
+    if( unlikely(err != 0) ) goto error;
+
+    // Make key
+    key.mv_size = hbs_str_len(tmpl) + 1;
+    key.mv_data = hbs_str_val(tmpl);
 
     // Make data
     data.mv_size = module_copy->size;
@@ -230,16 +309,17 @@ static void cache_add(
 
     // Store
     err = mdb_put(txn, dbi, &key, &data, 0);
+    if( unlikely(err != 0) ) goto error;
     handlebars_talloc_free(module_copy);
-    if( err != 0 ) goto error;
 
     // Commit
     err = mdb_txn_commit(txn);
-    if( err != 0 ) goto error;
+    HANDLE_RC(err);
 
     return;
 
 error:
+    handlebars_talloc_free(module_copy);
     mdb_txn_abort(txn);
     HANDLE_RC(err);
 }
@@ -261,10 +341,10 @@ static struct handlebars_cache_stat cache_stat(struct handlebars_cache * cache)
     HANDLE_RC(err);
 
     err = mdb_dbi_open(txn, NULL, MDB_CREATE, &dbi);
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
     err = mdb_stat(txn, dbi, &stat);
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
     intern->stat.name = "mmap";
     intern->stat.current_entries = stat.ms_entries;
@@ -286,12 +366,17 @@ static void cache_reset(struct handlebars_cache * cache)
     HANDLE_RC(err);
 
     err = mdb_dbi_open(txn, NULL, MDB_CREATE, &dbi);
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
     err = mdb_drop(txn, dbi, 0);
-    if( err != 0 ) goto error;
+    if( unlikely(err != 0) ) goto error;
 
-    error:
+    err = mdb_txn_commit(txn);
+    HANDLE_RC(err);
+    memset(&intern->stat, 0, sizeof(intern->stat));
+    return;
+
+error:
     mdb_txn_abort(txn);
     HANDLE_RC(err);
 }

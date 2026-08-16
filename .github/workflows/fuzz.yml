@@ -1,0 +1,110 @@
+name: fuzz
+
+on:
+    pull_request:
+        branches:
+            - master
+    schedule:
+        - cron: "17 4 * * 0"
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: fuzz-${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+    fuzz:
+        name: ${{ matrix.target }}
+        runs-on: ubuntu-24.04
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: template
+                      dictionary: handlebars.dict
+                      corpora: fuzz/corpus/template
+                    - target: json
+                      dictionary: json.dict
+                      corpora: fuzz/corpus/json
+                    - target: module
+                      dictionary: module.dict
+                      corpora: fuzz/corpus/module
+                    - target: lmdb
+                      dictionary: lmdb.dict
+                      corpora: fuzz/corpus/lmdb fuzz/corpus/module
+                    - target: yaml
+                      dictionary: yaml.dict
+                      corpora: fuzz/corpus/yaml
+        env:
+            FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '900' || '60' }}
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Install packages
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y autoconf automake clang-18 libclang-rt-18-dev libjson-c-dev liblmdb-dev libtalloc-dev libtool libyaml-dev m4 make pkg-config
+
+            - name: Restore generated corpus
+              uses: actions/cache@v5
+              with:
+                  path: fuzz-corpus/${{ matrix.target }}
+                  key: fuzz-${{ matrix.target }}-${{ runner.os }}-${{ github.run_id }}
+                  restore-keys: |
+                      fuzz-${{ matrix.target }}-${{ runner.os }}-
+
+            - name: Create configure
+              run: autoreconf -i
+
+            - name: Configure fuzz target
+              env:
+                  CC: clang-18
+                  CFLAGS: "-O1 -g"
+              run: >-
+                  ./configure
+                  --enable-fuzzing
+                  --disable-bats
+                  --disable-bison
+                  --disable-check
+                  --disable-flex
+                  --disable-gperf
+                  --disable-hardening
+                  --disable-pcre
+                  --disable-pthread
+                  --disable-shared
+                  --disable-subunit
+                  --disable-testing-exports
+                  --disable-valgrind
+                  --enable-yaml
+                  --without-handlebars-spec
+                  --without-mustache-spec
+
+            - name: Build fuzz target
+              run: make -j2
+
+            - name: Run ${{ matrix.target }} fuzzer
+              env:
+                  ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:strict_string_checks=1
+                  UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+              run: |
+                  mkdir -p fuzz-artifacts fuzz-corpus/${{ matrix.target }}
+                  ./fuzz/fuzz_${{ matrix.target }} \
+                      fuzz-corpus/${{ matrix.target }} \
+                      ${{ matrix.corpora }} \
+                      -artifact_prefix=fuzz-artifacts/ \
+                      -dict=fuzz/${{ matrix.dictionary }} \
+                      -max_len=65536 \
+                      -max_total_time="$FUZZ_SECONDS" \
+                      -timeout=10
+
+            - name: Upload crash artifacts
+              if: failure()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: fuzz-artifacts-${{ matrix.target }}-${{ github.run_id }}
+                  path: fuzz-artifacts/
+                  if-no-files-found: ignore

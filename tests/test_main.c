@@ -33,11 +33,70 @@
 
 
 
+#ifdef HANDLEBARS_MEMORY
+static size_t realloc_size_received;
+
+static void * capture_realloc_size(
+    const void * ctx,
+    void * ptr,
+    size_t size,
+    const char * name
+) {
+    (void) ctx;
+    (void) name;
+    realloc_size_received = size;
+    return ptr;
+}
+#endif
+
 START_TEST(test_version)
 {
     ck_assert_int_eq(handlebars_version(), HANDLEBARS_VERSION_PATCH
             + (HANDLEBARS_VERSION_MINOR * 100)
             + (HANDLEBARS_VERSION_MAJOR * 10000));
+}
+END_TEST
+
+START_TEST(test_talloc_array_rejects_unrepresentable_count)
+{
+    char * original = handlebars_talloc_array(context, char, 1);
+
+    ck_assert_ptr_ne(NULL, original);
+    original[0] = 'x';
+
+#if SIZE_MAX > UINT_MAX
+    size_t count = (size_t) UINT_MAX + 1;
+
+    ck_assert_ptr_eq(NULL, handlebars_talloc_array(context, char, count));
+    ck_assert_ptr_eq(NULL, handlebars_talloc_realloc(context, original, char, count));
+    ck_assert_int_eq('x', original[0]);
+#else
+    fprintf(stderr, "Skipped unrepresentable talloc count test on 32-bit size_t\n");
+#endif
+
+    ck_assert_ptr_eq(NULL, handlebars_talloc_array_checked(context, SIZE_MAX, 2, "overflow"));
+    ck_assert_ptr_eq(NULL, handlebars_talloc_realloc_array_checked(context, original, SIZE_MAX, 2, "overflow"));
+    ck_assert_int_eq('x', original[0]);
+}
+END_TEST
+
+START_TEST(test_talloc_realloc_size_preserves_size_t)
+{
+#ifdef HANDLEBARS_MEMORY
+    handlebars_talloc_realloc_size_func previous = _handlebars_talloc_realloc_size;
+    char marker;
+    void * result;
+
+    realloc_size_received = 0;
+    _handlebars_talloc_realloc_size = &capture_realloc_size;
+    result = handlebars_talloc_realloc_size(context, &marker, SIZE_MAX);
+    _handlebars_talloc_realloc_size = previous;
+
+    ck_assert_ptr_eq(&marker, result);
+    ck_assert_uint_eq(SIZE_MAX, realloc_size_received);
+#else
+    fprintf(stderr, "Skipped, memory testing functions are disabled\n");
+#endif
 }
 END_TEST
 
@@ -84,6 +143,53 @@ START_TEST(test_lex)
     ck_assert_str_eq("}}", hbs_str_val(handlebars_token_get_text(tokens[2])));
 
     ck_assert_ptr_eq(NULL, tokens[3]);
+}
+END_TEST
+
+START_TEST(test_parse_rejects_embedded_nul)
+{
+    static const char tmpl[] = {'\0', (char) 0xff};
+    struct handlebars_ast_node * ast;
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, tmpl, sizeof(tmpl)),
+        0
+    );
+
+    ck_assert_ptr_eq(NULL, ast);
+    ck_assert_int_eq(HANDLEBARS_PARSEERR, handlebars_error_num(HBSCTX(parser)));
+    ck_assert_ptr_ne(NULL, strstr(handlebars_error_msg(HBSCTX(parser)), "embedded NUL"));
+}
+END_TEST
+
+START_TEST(test_parse_handles_empty_trimmed_block)
+{
+    struct handlebars_ast_node * ast;
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("  {{~#each his}}{{~/each~}}\n")),
+        0
+    );
+
+    ck_assert_ptr_ne(NULL, ast);
+    ck_assert_int_eq(HANDLEBARS_SUCCESS, handlebars_error_num(HBSCTX(parser)));
+}
+END_TEST
+
+START_TEST(test_parse_handles_empty_right_trimmed_block)
+{
+    struct handlebars_ast_node * ast;
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("{{#each x~}}{{/each}}")),
+        0
+    );
+
+    ck_assert_ptr_ne(NULL, ast);
+    ck_assert_int_eq(HANDLEBARS_SUCCESS, handlebars_error_num(HBSCTX(parser)));
 }
 END_TEST
 
@@ -240,10 +346,15 @@ static Suite * suite(void)
     Suite * s = suite_create("Handlebars");
 
     REGISTER_TEST_FIXTURE(s, test_version, "Version");
+    REGISTER_TEST_FIXTURE(s, test_talloc_array_rejects_unrepresentable_count, "Talloc Array Count Bounds");
+    REGISTER_TEST_FIXTURE(s, test_talloc_realloc_size_preserves_size_t, "Talloc Realloc Size Width");
     REGISTER_TEST_FIXTURE(s, test_version_string, "Version String");
     REGISTER_TEST_FIXTURE(s, test_handlebars_spec_version_string, "Handlebars Spec Version String");
     REGISTER_TEST_FIXTURE(s, test_mustache_spec_version_string, "Mustache Spec Version String");
     REGISTER_TEST_FIXTURE(s, test_lex, "Lex Convenience Function");
+    REGISTER_TEST_FIXTURE(s, test_parse_rejects_embedded_nul, "Reject Embedded NUL");
+    REGISTER_TEST_FIXTURE(s, test_parse_handles_empty_trimmed_block, "Parse Empty Trimmed Block");
+    REGISTER_TEST_FIXTURE(s, test_parse_handles_empty_right_trimmed_block, "Parse Empty Right-Trimmed Block");
     REGISTER_TEST_FIXTURE(s, test_context_ctor_dtor, "Constructor/Destructor");
     REGISTER_TEST_FIXTURE(s, test_context_ctor_failed_alloc, "Constructor (failed alloc)");
     REGISTER_TEST_FIXTURE(s, test_context_ctor_ex_failed_alloc, "Constructor ex (failed alloc)");

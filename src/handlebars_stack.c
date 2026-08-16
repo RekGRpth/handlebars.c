@@ -20,6 +20,7 @@
 #endif
 
 #include <assert.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <talloc.h>
 
@@ -60,8 +61,15 @@ struct handlebars_stack {
 };
 
 void * HANDLEBARS_STACK_ALLOC_PTR = NULL;
+size_t HANDLEBARS_STACK_ALLOC_CAPACITY = 0;
 
 size_t handlebars_stack_size(size_t capacity) {
+    const size_t max_values = (SIZE_MAX - sizeof(struct handlebars_stack)) / sizeof(struct handlebars_value);
+
+    if( capacity >= max_values ) {
+        return 0;
+    }
+
     return (sizeof(struct handlebars_stack) + sizeof(struct handlebars_value) * (capacity + 1));
 }
 
@@ -93,7 +101,7 @@ static inline struct handlebars_stack * stack_separate(struct handlebars_stack *
 #ifndef HANDLEBARS_NO_REFCOUNT
     if (handlebars_rc_refcount(&stack->rc) > 1) {
         // Cannot resize if this stack was stack allocated
-        if (!(stack->flags & HANDLEBARS_STACK_TALLOCATED)) {
+        if( unlikely(!(stack->flags & HANDLEBARS_STACK_TALLOCATED)) ) {
             handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Stack overflow");
         }
         struct handlebars_stack * prev_stack = stack;
@@ -112,6 +120,10 @@ static inline struct handlebars_stack * stack_separate(struct handlebars_stack *
 
 struct handlebars_stack * handlebars_stack_init(struct handlebars_context * ctx, struct handlebars_stack * stack, size_t elem)
 {
+    if( unlikely(handlebars_stack_size(elem) == 0) ) {
+        handlebars_throw(ctx, HANDLEBARS_STACK_OVERFLOW, "Stack capacity is too large: %zu", elem);
+    }
+
     memset(stack, 0, sizeof(struct handlebars_stack));
     stack->ctx = ctx;
     stack->capacity = elem;
@@ -123,7 +135,14 @@ struct handlebars_stack * handlebars_stack_init(struct handlebars_context * ctx,
 
 struct handlebars_stack * handlebars_stack_ctor(struct handlebars_context * ctx, size_t capacity)
 {
-    struct handlebars_stack * stack = handlebars_talloc_size(ctx, handlebars_stack_size(capacity));
+    size_t size = handlebars_stack_size(capacity);
+    struct handlebars_stack * stack;
+
+    if( unlikely(size == 0) ) {
+        handlebars_throw(ctx, HANDLEBARS_STACK_OVERFLOW, "Stack capacity is too large: %zu", capacity);
+    }
+
+    stack = handlebars_talloc_size(ctx, size);
     HANDLEBARS_MEMCHECK(stack, ctx);
     talloc_set_type(stack, struct handlebars_stack);
     memset(stack, 0, sizeof(struct handlebars_stack));
@@ -148,6 +167,7 @@ struct handlebars_stack * handlebars_stack_copy_ctor(struct handlebars_stack * p
         handlebars_value_value(&stack->v[i], &prev_stack->v[i]);
     }
     stack->i = prev_stack->i;
+    stack->protect = prev_stack->protect;
     return stack;
 }
 
@@ -181,21 +201,35 @@ static void handlebars_stack_dump(struct handlebars_stack * stack) {
 
 struct handlebars_stack * handlebars_stack_push(struct handlebars_stack * stack, struct handlebars_value * value)
 {
+    struct handlebars_value value_copy;
+
     assert(stack != NULL);
     assert(value != NULL);
 
-    if( stack->capacity > stack->i ) {
+    /* The source may point into this stack. Preserve its bytes before a
+     * resize replaces the stack; copied elements keep referenced payloads
+     * alive. */
+    value_copy = *value;
+
+    if( likely(stack->capacity > stack->i) ) {
         // Separate if refcount > 1
         stack = stack_separate(stack);
     } else {
         // Resize array if necessary
 
         // Cannot resize if this stack was stack allocated
-        if (!(stack->flags & HANDLEBARS_STACK_TALLOCATED)) {
+        if( unlikely(!(stack->flags & HANDLEBARS_STACK_TALLOCATED)) ) {
             handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Stack overflow");
         }
 
-        size_t capacity = (stack->capacity | 3) * 3 / 2;
+        size_t capacity = stack->capacity | 3;
+        if( unlikely(capacity > SIZE_MAX / 3) ) {
+            handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Stack capacity is too large: %zu", stack->capacity);
+        }
+        capacity = capacity * 3 / 2;
+        if( unlikely(capacity <= stack->capacity || handlebars_stack_size(capacity) == 0) ) {
+            handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Stack capacity is too large: %zu", stack->capacity);
+        }
         struct handlebars_stack * prev_stack = stack;
         stack = handlebars_stack_copy_ctor(prev_stack, capacity);
         handlebars_stack_delref(prev_stack);
@@ -203,7 +237,7 @@ struct handlebars_stack * handlebars_stack_push(struct handlebars_stack * stack,
     }
 
     handlebars_value_init(&stack->v[stack->i]);
-    handlebars_value_value(&stack->v[stack->i], value);
+    handlebars_value_value(&stack->v[stack->i], &value_copy);
     stack->i++;
 
     return stack;
@@ -217,12 +251,12 @@ struct handlebars_value * handlebars_stack_pop(struct handlebars_stack * stack, 
 
     // we need to change the API of pop to support separation, but we're not really using it anywhere
 #ifndef HANDLEBARS_NO_REFCOUNT
-    if (handlebars_rc_refcount(&stack->rc) > 1) {
+    if( unlikely(handlebars_rc_refcount(&stack->rc) > 1) ) {
         handlebars_throw(stack->ctx, HANDLEBARS_ERROR, "Attempting to pop protected stack with refcount > 1");
     }
 #endif
 
-    if (stack->i < stack->protect) {
+    if( unlikely(stack->i <= stack->protect) ) {
         handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Attempting to pop protected stack segment i=%zu protect=%zu", stack->i, stack->protect);
     }
 
@@ -260,16 +294,13 @@ struct handlebars_stack * handlebars_stack_set(struct handlebars_stack * stack, 
         return handlebars_stack_push(stack, value);
     }
 
-    // Separate if refcount > 1
-    stack = stack_separate(stack);
-
     // Out-of-bounds
-    if( offset >= stack->i ) {
+    if( unlikely(offset >= stack->i) ) {
         handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Out-of-bounds %zu/%zu", offset, stack->i);
     }
 
     // Protect
-    if (offset < stack->protect) {
+    if( unlikely(offset < stack->protect) ) {
         handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Attempting to set protected stack segment offset=%zu protect=%zu", offset, stack->protect);
     }
 
@@ -277,6 +308,9 @@ struct handlebars_stack * handlebars_stack_set(struct handlebars_stack * stack, 
     if( value == &stack->v[offset] ) {
         return stack;
     }
+
+    // Separate if refcount > 1
+    stack = stack_separate(stack);
 
     handlebars_value_value(&stack->v[offset], value);
 

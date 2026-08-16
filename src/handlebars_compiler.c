@@ -20,12 +20,9 @@
 #endif
 
 #include <assert.h>
+#include <limits.h>
 #include <string.h>
 #include <talloc.h>
-
-#ifdef HAVE_ALLOCA_H
-#include <alloca.h>
-#endif
 
 #define HANDLEBARS_AST_PRIVATE
 #define HANDLEBARS_AST_LIST_PRIVATE
@@ -89,6 +86,8 @@ struct handlebars_compiler {
     struct handlebars_program * program;
     struct handlebars_block_param_stack * bps;
     struct handlebars_source_node_stack * sns;
+    bool owns_bps;
+    bool owns_sns;
 
     /**
      * @brief Array of known helpers
@@ -112,13 +111,13 @@ struct handlebars_block_param_pair {
 };
 
 struct handlebars_block_param_stack {
-    struct handlebars_block_param_pair s[HANDLEBARS_COMPILER_STACK_SIZE];
     int i;
+    struct handlebars_block_param_pair s[HANDLEBARS_COMPILER_STACK_SIZE];
 };
 
 struct handlebars_source_node_stack {
-    struct handlebars_ast_node * s[HANDLEBARS_COMPILER_STACK_SIZE];
     int i;
+    struct handlebars_ast_node * s[HANDLEBARS_COMPILER_STACK_SIZE];
 };
 
 
@@ -174,7 +173,18 @@ static inline void handlebars_compiler_accept_decorator(
 );
 
 const size_t HANDLEBARS_COMPILER_SIZE = sizeof(struct handlebars_compiler);
-const size_t HANDLEBARS_PROGRAM_SIZE = sizeof(struct handlebars_compiler);
+const size_t HANDLEBARS_PROGRAM_SIZE = sizeof(struct handlebars_program);
+
+static size_t handlebars_compiler_capacity_add(
+    struct handlebars_context * context,
+    size_t capacity,
+    size_t increment
+) {
+    if( unlikely(increment > UINT_MAX || capacity > (size_t) UINT_MAX - increment) ) {
+        handlebars_throw(context, HANDLEBARS_NOMEM, "Compiler array capacity is too large");
+    }
+    return capacity + increment;
+}
 
 
 
@@ -256,7 +266,8 @@ struct handlebars_string ** handlebars_ast_node_get_id_parts(struct handlebars_c
         return NULL;
     }
 
-    arrptr = arr = MC(handlebars_talloc_array(compiler, struct handlebars_string *, num + 1));
+    num = handlebars_compiler_capacity_add(CONTEXT, num, 1);
+    arrptr = arr = MC(handlebars_talloc_array(compiler, struct handlebars_string *, num));
 
     handlebars_ast_list_foreach(ast_node->node.path.parts, item, tmp) {
         assert(item->data);
@@ -377,6 +388,9 @@ static inline long handlebars_compiler_compile_program(
                    node->type == HANDLEBARS_AST_NODE_CONTENT);
 
     program = compiler->program;
+    if( unlikely(compiler->guid == LONG_MAX) ) {
+        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Compiler program index is too large");
+    }
     subcompiler = MC(handlebars_compiler_ctor(HBSCTX(compiler)));
     subcompiler->program->main = program->main;
 
@@ -384,25 +398,34 @@ static inline long handlebars_compiler_compile_program(
     handlebars_compiler_set_flags(subcompiler, handlebars_compiler_get_flags(compiler));
     subcompiler->bps = compiler->bps;
     subcompiler->sns = compiler->sns;
+    subcompiler->owns_bps = false;
+    subcompiler->owns_sns = false;
     subcompiler->known_helpers = compiler->known_helpers;
 
     // compile
     handlebars_compiler_compile(subcompiler, node);
     subcompiler->program->flags = subcompiler->flags;
-    guid = compiler->guid++;
+    guid = compiler->guid;
 
     // Don't propogate use_decorators
     program->result_flags |= (subcompiler->program->result_flags & ~handlebars_compiler_result_flag_use_decorators);
 
     // Realloc children array
     if( program->children_size <= program->children_length ) {
-        program->children_size += 2;
-        program->children = MC(handlebars_talloc_realloc(program, program->children,
-                    struct handlebars_program *, program->children_size));
+        size_t new_size = handlebars_compiler_capacity_add(CONTEXT, program->children_size, 2);
+        struct handlebars_program ** children = MC(handlebars_talloc_realloc(
+            program,
+            program->children,
+            struct handlebars_program *,
+            new_size
+        ));
+        program->children = children;
+        program->children_size = new_size;
     }
 
     // Append child
     program->children[program->children_length++] = talloc_steal(program, subcompiler->program);
+    compiler->guid++;
 
     handlebars_talloc_free(subcompiler);
     return guid;
@@ -419,9 +442,15 @@ void handlebars_compiler_opcode(
 
     // Realloc opcode array
     if( program->opcodes_size <= program->opcodes_length ) {
-        program->opcodes = MC(handlebars_talloc_realloc(program, program->opcodes,
-                    struct handlebars_opcode *, program->opcodes_size + 32));
-        program->opcodes_size += 32;
+        size_t new_size = handlebars_compiler_capacity_add(CONTEXT, program->opcodes_size, 32);
+        struct handlebars_opcode ** opcodes = MC(handlebars_talloc_realloc(
+            program,
+            program->opcodes,
+            struct handlebars_opcode *,
+            new_size
+        ));
+        program->opcodes = opcodes;
+        program->opcodes_size = new_size;
     }
 
     // Get location from source node stack
@@ -691,7 +720,7 @@ static inline void handlebars_compiler_accept_program(
 
     assert(compiler != NULL);
 
-    if( compiler->bps->i > HANDLEBARS_COMPILER_STACK_SIZE ) {
+    if( unlikely(compiler->bps->i >= HANDLEBARS_COMPILER_STACK_SIZE) ) {
         handlebars_throw(CONTEXT, HANDLEBARS_STACK_OVERFLOW, "Block param stack blown");
     }
     compiler->bps->s[compiler->bps->i].block_param1 = block_param1;
@@ -977,13 +1006,25 @@ static inline void handlebars_compiler_accept_decorator(
     if( compiler->flags & handlebars_compiler_flag_alternate_decorators ) {
         // Realloc decorators array
         if( program->decorators_size <= program->decorators_length ) {
-            program->decorators = MC(handlebars_talloc_realloc(program, program->decorators,
-                        struct handlebars_program *, program->decorators_size + 8));
-            program->decorators_size += 8;
+            size_t new_size = handlebars_compiler_capacity_add(CONTEXT, program->decorators_size, 8);
+            struct handlebars_program ** decorators = MC(handlebars_talloc_realloc(
+                program,
+                program->decorators,
+                struct handlebars_program *,
+                new_size
+            ));
+            program->decorators = decorators;
+            program->decorators_size = new_size;
         }
 
         origcompiler = compiler;
         subcompiler = talloc_steal(compiler, handlebars_compiler_ctor(CONTEXT));
+        handlebars_compiler_set_flags(subcompiler, handlebars_compiler_get_flags(compiler));
+        subcompiler->bps = compiler->bps;
+        subcompiler->sns = compiler->sns;
+        subcompiler->owns_bps = false;
+        subcompiler->owns_sns = false;
+        subcompiler->known_helpers = compiler->known_helpers;
         program->decorators[program->decorators_length++] = talloc_steal(program, subcompiler->program);
         compiler = subcompiler;
 
@@ -1106,6 +1147,9 @@ static inline void handlebars_compiler_accept_sexpr_helper(
     assert(path->type == HANDLEBARS_AST_NODE_PATH);
 
     name = handlebars_ast_node_get_id_part(path);
+    if( name == NULL ) {
+        name = path->node.path.original;
+    }
 
     if( handlebars_compiler_is_known_helper(compiler, path) ) {
         struct handlebars_opcode * opcode = handlebars_opcode_ctor(CONTEXT, handlebars_opcode_type_invoke_known_helper);
@@ -1367,7 +1411,7 @@ static void handlebars_compiler_accept(
     }
 
     // Add node to source node stack
-    if( compiler->sns->i > HANDLEBARS_COMPILER_STACK_SIZE ) {
+    if( unlikely(compiler->sns->i >= HANDLEBARS_COMPILER_STACK_SIZE) ) {
         handlebars_throw(CONTEXT, HANDLEBARS_STACK_OVERFLOW, "Source node stack blown");
     }
     compiler->sns->s[compiler->sns->i] = node;
@@ -1457,13 +1501,18 @@ void handlebars_compiler_compile(
         }
     }
 
-    // Allocate stacks
+    // Allocate persistent stacks. These cannot live in alloca storage because
+    // an error may longjmp past this frame and the compiler can be reused.
     if (!compiler->bps) {
-        compiler->bps = alloca(sizeof(struct handlebars_block_param_stack));
+        compiler->bps = MC(handlebars_talloc_zero(compiler, struct handlebars_block_param_stack));
+        compiler->owns_bps = true;
+    } else if( compiler->owns_bps ) {
         compiler->bps->i = 0;
     }
     if (!compiler->sns) {
-        compiler->sns = alloca(sizeof(struct handlebars_source_node_stack));
+        compiler->sns = MC(handlebars_talloc_zero(compiler, struct handlebars_source_node_stack));
+        compiler->owns_sns = true;
+    } else if( compiler->owns_sns ) {
         compiler->sns->i = 0;
     }
 
@@ -1471,10 +1520,12 @@ void handlebars_compiler_compile(
     compiler->program->flags = compiler->flags;
     handlebars_compiler_accept(compiler, node);
 
-    // Reset stacks
-    compiler->bps = NULL;
-    compiler->sns = NULL;
-
 done:
+    if( compiler->owns_bps && compiler->bps ) {
+        compiler->bps->i = 0;
+    }
+    if( compiler->owns_sns && compiler->sns ) {
+        compiler->sns->i = 0;
+    }
     e->jmp = prev;
 }

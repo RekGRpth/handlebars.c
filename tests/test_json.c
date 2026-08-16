@@ -56,6 +56,16 @@ START_TEST(test_boolean_json_false)
 }
 END_TEST
 
+START_TEST(test_null_json_object)
+{
+    HANDLEBARS_VALUE_DECL(value);
+    handlebars_value_init_json_object(context, value, NULL);
+    ck_assert_int_eq(handlebars_value_get_type(value), HANDLEBARS_VALUE_TYPE_NULL);
+    HANDLEBARS_VALUE_UNDECL(value);
+    ASSERT_INIT_BLOCKS();
+}
+END_TEST
+
 START_TEST(test_int_json)
 {
     HANDLEBARS_VALUE_DECL(value);
@@ -113,6 +123,24 @@ START_TEST(test_array_iterator_json)
 }
 END_TEST
 
+START_TEST(test_empty_array_iterator_json)
+{
+    HANDLEBARS_VALUE_DECL(value);
+    int count = 0;
+
+    handlebars_value_init_json_string(context, value, "[]");
+    HANDLEBARS_VALUE_FOREACH(value, child) {
+        (void) child;
+        count++;
+    } HANDLEBARS_VALUE_FOREACH_END();
+
+    ck_assert_int_eq(count, 0);
+    ck_assert_int_eq(handlebars_value_count(value), 0);
+    HANDLEBARS_VALUE_UNDECL(value);
+    ASSERT_INIT_BLOCKS();
+}
+END_TEST
+
 START_TEST(test_map_iterator_json)
 {
     HANDLEBARS_VALUE_DECL(value);
@@ -133,6 +161,24 @@ START_TEST(test_map_iterator_json)
         ck_assert_int_eq(handlebars_value_get_intval(child), i);
     } HANDLEBARS_VALUE_FOREACH_END();
 
+    HANDLEBARS_VALUE_UNDECL(value);
+    ASSERT_INIT_BLOCKS();
+}
+END_TEST
+
+START_TEST(test_empty_map_iterator_json)
+{
+    HANDLEBARS_VALUE_DECL(value);
+    int count = 0;
+
+    handlebars_value_init_json_string(context, value, "{}");
+    HANDLEBARS_VALUE_FOREACH(value, child) {
+        (void) child;
+        count++;
+    } HANDLEBARS_VALUE_FOREACH_END();
+
+    ck_assert_int_eq(count, 0);
+    ck_assert_int_eq(handlebars_value_count(value), 0);
     HANDLEBARS_VALUE_UNDECL(value);
     ASSERT_INIT_BLOCKS();
 }
@@ -297,11 +343,14 @@ static Suite * suite(void)
 
     REGISTER_TEST_FIXTURE(s, test_boolean_json_true, "Boolean - true");
     REGISTER_TEST_FIXTURE(s, test_boolean_json_false, "Boolean - false");
+    REGISTER_TEST_FIXTURE(s, test_null_json_object, "Null object");
     REGISTER_TEST_FIXTURE(s, test_int_json, "Integer");
     REGISTER_TEST_FIXTURE(s, test_float_json, "Float");
     REGISTER_TEST_FIXTURE(s, test_string_json, "String");
     REGISTER_TEST_FIXTURE(s, test_array_iterator_json, "Array iterator");
+    REGISTER_TEST_FIXTURE(s, test_empty_array_iterator_json, "Empty array iterator");
     REGISTER_TEST_FIXTURE(s, test_map_iterator_json, "Map iterator");
+    REGISTER_TEST_FIXTURE(s, test_empty_map_iterator_json, "Empty map iterator");
     REGISTER_TEST_FIXTURE(s, test_array_find_json, "Array Find");
     REGISTER_TEST_FIXTURE(s, test_map_find_json, "Map Find");
     REGISTER_TEST_FIXTURE(s, test_complex_json, "Complex");

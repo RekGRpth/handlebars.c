@@ -22,11 +22,13 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include "handlebars.h"
 #include "handlebars_memory.h"
 #include "handlebars_parser.h"
 #include "handlebars_private.h"
+#include "handlebars_string.h"
 #include "handlebars_token.h"
 
 #pragma GCC diagnostic push
@@ -83,6 +85,15 @@ void handlebars_parser_dtor(struct handlebars_parser * parser)
 #undef CONTEXT
 #define CONTEXT HBSCTX(parser)
 
+static void handlebars_parser_validate_template(
+    struct handlebars_parser * parser,
+    struct handlebars_string * tmpl
+) {
+    if( unlikely(memchr(hbs_str_val(tmpl), '\0', hbs_str_len(tmpl)) != NULL) ) {
+        handlebars_throw(CONTEXT, HANDLEBARS_PARSEERR, "Template contains an embedded NUL byte");
+    }
+}
+
 struct handlebars_token ** handlebars_lex_ex(
     struct handlebars_parser * parser,
     struct handlebars_string * tmpl
@@ -105,6 +116,8 @@ struct handlebars_token ** handlebars_lex(struct handlebars_parser * parser)
             return NULL;
         }
     }
+
+    handlebars_parser_validate_template(parser, parser->tmpl);
 
     YYSTYPE yylval_param;
     YYLTYPE yylloc_param;
@@ -144,22 +157,40 @@ struct handlebars_token ** handlebars_lex(struct handlebars_parser * parser)
 struct handlebars_ast_node * handlebars_parse_ex(struct handlebars_parser * parser, struct handlebars_string * tmpl, unsigned flags)
 {
     struct handlebars_error * e = HBSCTX(parser)->e;
-    jmp_buf * prev = e->jmp;
+    jmp_buf * volatile prev = e->jmp;
     jmp_buf buf;
 
-    // Save jump buffer
-    if( !prev ) {
-        if( handlebars_setjmp_ex(parser, &buf) ) {
-            e->jmp = prev;
-            return NULL;
-        }
+    if( unlikely(parser->bison_stack != NULL) ) {
+        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Parser is already in use");
     }
+
+    // Always install a local jump buffer so the Bison stack can be released
+    // before propagating an error to the caller's jump buffer.
+    if( handlebars_setjmp_ex(parser, &buf) ) {
+        if( parser->bison_stack ) {
+            handlebars_talloc_free(parser->bison_stack);
+            parser->bison_stack = NULL;
+        }
+        e->jmp = prev;
+        if( prev ) {
+            longjmp(*prev, e->num);
+        }
+        return NULL;
+    }
+
+    assert(parser->bison_stack == NULL);
+    parser->bison_stack = handlebars_talloc_size(parser, 0);
+    HANDLEBARS_MEMCHECK(parser->bison_stack, HBSCTX(parser));
+
+    handlebars_parser_validate_template(parser, tmpl);
 
     parser->tmpl = tmpl;
     parser->flags = flags;
 
     handlebars_yy_parse(parser);
 
+    handlebars_talloc_free(parser->bison_stack);
+    parser->bison_stack = NULL;
     e->jmp = prev;
     return parser->program;
 }

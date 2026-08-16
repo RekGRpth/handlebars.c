@@ -21,6 +21,7 @@ if CHECK
 SUBDIRS += tests
 endif
 SUBDIRS += bench
+SUBDIRS += fuzz
 
 EXTRA_DIST = LICENSE.md LICENSE-AGPL.md LICENSE-GPL.md README.md CHANGELOG.md spec/handlebars/export spec/handlebars/spec spec/mustache/specs vendor
 
@@ -49,7 +50,7 @@ CODE_COVERAGE_IGNORE_PATTERN = \
 CODE_COVERAGE_LCOV_RMOPTS = $(CODE_COVERAGE_LCOV_RMOPTS_DEFAULT) \
 	--ignore-errors unused
 CODE_COVERAGE_GENHTML_OPTIONS = $(CODE_COVERAGE_GENHTML_OPTIONS_DEFAULT) \
-	--ignore-errors unmapped
+	$(GENHTML_IGNORE_ERRORS_UNMAPPED)
 include $(top_srcdir)/build/aminclude_static.am
 clean-local: code-coverage-clean my-clean-local
 distclean-local: code-coverage-dist-clean
