@@ -40,10 +40,18 @@ extern const size_t HANDLEBARS_STRING_SIZE;
 size_t handlebars_string_size(size_t length);
 
 // {{{ Accessors
-char * hbs_str_val(struct handlebars_string * str)
+/**
+ * @brief Return the string's borrowed, read-only byte buffer.
+ *
+ * The buffer is terminated by a NUL byte, but may contain embedded NUL bytes;
+ * use #hbs_str_len for its logical length. It remains valid only while @p str
+ * remains alive and unmodified. Use the string mutation APIs rather than
+ * casting away const, so copy-on-write and the cached hash remain valid.
+ */
+const char * hbs_str_val(const struct handlebars_string * str)
     HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL;
 
-size_t hbs_str_len(struct handlebars_string * str)
+size_t hbs_str_len(const struct handlebars_string * str)
     HBS_ATTR_NONNULL_ALL;
 
 uint32_t hbs_str_hash(struct handlebars_string * str)
@@ -68,14 +76,34 @@ uint32_t handlebars_string_hash(const char * str, size_t len)
 // }}} Hash functions
 
 // {{{ Reference Counting
+/**
+ * @brief Retain a shared reference to a string within its talloc lifetime.
+ *
+ * This does not allow the string to outlive its talloc parent.
+ */
 void handlebars_string_addref(struct handlebars_string * string)
     HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Release a string reference.
+ *
+ * In a refcounted build, releasing the final reference frees the string. In a
+ * no-refcount build, the talloc parent remains responsible for cleanup.
+ */
 void handlebars_string_delref(struct handlebars_string * string)
     HBS_ATTR_NONNULL_ALL;
 void handlebars_string_addref_ex(struct handlebars_string * string, const char * expr, const char * loc)
     HBS_ATTR_NONNULL_ALL;
 void handlebars_string_delref_ex(struct handlebars_string * string, const char * expr, const char * loc)
     HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Prevent reference-count deletion of a string.
+ *
+ * The string remains a child of its talloc parent and is freed when that
+ * ownership tree is destroyed. This is serializer machinery, not an ownership
+ * transfer operation.
+ */
 void handlebars_string_immortalize(struct handlebars_string * string)
     HBS_ATTR_NONNULL_ALL;
 
@@ -118,12 +146,14 @@ struct handlebars_string * handlebars_str_reduce(
 /**
  * @brief Performs a string replace.
  * @param[in] context The handlebars context
- * @param[in] string The input string
+ * @param[in] string The borrowed input string
  * @param[in] search The search string
  * @param[in] search_len The search string length
  * @param[in] replacement The replacement string
  * @param[in] replacement_len The replacement string length
- * @return A newly allocated string, transformed
+ * @return A newly allocated string, transformed. The result is distinct from
+ *         @p string even when the input or search string is empty or no match
+ *         is found.
  */
 struct handlebars_string * handlebars_str_replace(
     struct handlebars_context * context,
@@ -255,13 +285,12 @@ struct handlebars_string * handlebars_string_implode(
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
 
 /**
- * @brief Indent all text by the specified indent
- * @param[in] context
- * @param[in] str
- * @param[in] str_len
- * @param[in] indent
- * @param[in] indent_len
- * @return A newly constructed string
+ * @brief Indent all text by the specified indent, consuming one reference to
+ *        the input string
+ * @param[in] context The handlebars context
+ * @param[in] string The input string; one reference is consumed
+ * @param[in] indent_str The borrowed indentation string
+ * @return A newly constructed string under @p context
  */
 struct handlebars_string * handlebars_string_indent(
     struct handlebars_context * context,
@@ -269,6 +298,16 @@ struct handlebars_string * handlebars_string_indent(
     const struct handlebars_string * indent_str
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
 
+/**
+ * @brief Append indented text, consuming one reference to the input string
+ * @param[in] context The handlebars context
+ * @param[in,out] append_to_string The destination string. It may be moved by
+ *                reallocation, so callers must use the returned pointer.
+ * @param[in] input_string The input string; one reference is consumed unless
+ *            it is also @p append_to_string
+ * @param[in] indent_str The borrowed indentation string
+ * @return The destination string, unless moved by reallocation
+ */
 struct handlebars_string * handlebars_string_indent_append(
     struct handlebars_context * context,
     struct handlebars_string * append_to_string,
@@ -393,9 +432,9 @@ struct handlebars_string * handlebars_string_append(
 /**
  * @brief Append to a string
  * @param[in] context
- * @param[in] string
- * @param[in] str
- * @return The original string, unless moved by reallocation
+ * @param[in,out] string The destination string
+ * @param[in] string2 The borrowed source string; ownership remains with the caller
+ * @return The destination string, unless moved by reallocation
  */
 struct handlebars_string * handlebars_string_append_str(
     struct handlebars_context * context,

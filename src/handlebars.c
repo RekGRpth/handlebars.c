@@ -30,6 +30,8 @@
 #include "handlebars_private.h"
 
 
+static const char handlebars_nomem_msg[] = HANDLEBARS_MEMCHECK_MSG;
+
 
 int handlebars_version(void) {
     return HANDLEBARS_VERSION_PATCH
@@ -108,10 +110,21 @@ const char * handlebars_error_msg(struct handlebars_context * context)
     return context->e->msg;
 }
 
+void handlebars_error_clear(struct handlebars_context * context)
+{
+    struct handlebars_error * error = context->e;
+
+    assert(error != NULL);
+    if( error->msg != NULL && error->msg != handlebars_nomem_msg ) {
+        handlebars_talloc_free((char *) error->msg);
+    }
+    error->num = HANDLEBARS_SUCCESS;
+    error->msg = NULL;
+    memset(&error->loc, 0, sizeof(error->loc));
+}
+
 char * handlebars_error_message(struct handlebars_context * context)
 {
-    char * errmsg;
-    char errbuf[256];
     struct handlebars_error * e = context->e;
 
     assert(context != NULL);
@@ -121,26 +134,17 @@ char * handlebars_error_message(struct handlebars_context * context)
         return NULL;
     }
 
-    snprintf(errbuf, sizeof(errbuf), "%s on line %d, column %d",
-             e->msg,
-             e->loc.last_line,
-             e->loc.last_column);
-
-    errmsg = handlebars_talloc_strdup(context, errbuf);
-    if( unlikely(errmsg == NULL) ) {
-        // this might be a bad idea...
-        // fprintf(stderr, "%s\n", e->msg);
-        // abort();
-        return (char *) e->msg;
-    }
-
-    return errmsg;
+    return handlebars_talloc_asprintf(
+        context,
+        "%s on line %d, column %d",
+        e->msg,
+        e->loc.last_line,
+        e->loc.last_column
+    );
 }
 
 char * handlebars_error_message_js(struct handlebars_context * context)
 {
-    char * errmsg;
-    char errbuf[512];
     struct handlebars_error * e = context->e;
 
     assert(context != NULL);
@@ -151,20 +155,13 @@ char * handlebars_error_message_js(struct handlebars_context * context)
 
     // @todo check errno == HANDLEBARS_PARSEERR
 
-    snprintf(errbuf, sizeof(errbuf), "Parse error on line %d, column %d : %s",
-             e->loc.first_line,
-             e->loc.first_column,
-             e->msg);
-
-    errmsg = handlebars_talloc_strdup(context, errbuf);
-    if( unlikely(errmsg == NULL) ) {
-        // this might be a bad idea...
-        // fprintf(stderr, "%s\n", e->msg);
-        // abort();
-        return (char *) e->msg;
-    }
-
-    return errmsg;
+    return handlebars_talloc_asprintf(
+        context,
+        "Parse error on line %d, column %d : %s",
+        e->loc.first_line,
+        e->loc.first_column,
+        e->msg
+    );
 }
 
 #ifdef __clang__
@@ -176,19 +173,47 @@ HBS_ATTR_PRINTF(4, 0)
 static void _set_err(struct handlebars_context * context, enum handlebars_error_type num, struct handlebars_locinfo * loc, const char * msg, va_list ap)
 {
     struct handlebars_error * e = context->e;
+    const char * old_msg = e->msg;
+    char * new_msg;
+
+    // Format before releasing the previous message because it may be one of
+    // the arguments, as it is when rethrowing an existing error.
+    new_msg = talloc_vasprintf(e, msg, ap);
+    if( old_msg != NULL && old_msg != handlebars_nomem_msg ) {
+        talloc_free((char *) old_msg);
+    }
+
     e->num = num;
-
-    e->msg = talloc_vasprintf(context, msg, ap);
-
-    if( unlikely(e->msg == NULL) ) {
+    if( unlikely(new_msg == NULL) ) {
         e->num = HANDLEBARS_NOMEM;
-        e->msg = HANDLEBARS_MEMCHECK_MSG;
+        e->msg = handlebars_nomem_msg;
+    } else {
+        e->msg = new_msg;
     }
     if( loc ) {
         e->loc = *loc;
     } else {
         memset(&e->loc, 0, sizeof(e->loc));
     }
+}
+
+void handlebars_error_set(
+    struct handlebars_context * context,
+    enum handlebars_error_type num,
+    const char * msg,
+    ...
+) {
+    va_list ap;
+
+    va_start(ap, msg);
+    _set_err(context, num, NULL, msg, ap);
+    va_end(ap);
+}
+
+void handlebars_longjmp(struct handlebars_context * context, jmp_buf * target, int num)
+{
+    handlebars_value_iterator_unwind(context->e, target);
+    longjmp(*target, num);
 }
 
 void handlebars_throw(struct handlebars_context * context, enum handlebars_error_type num, const char * msg, ...)
@@ -204,7 +229,7 @@ void handlebars_throw(struct handlebars_context * context, enum handlebars_error
     const bool do_throw = true;
 #endif
     if( e->jmp && do_throw ) {
-        longjmp(*e->jmp, num);
+        handlebars_longjmp(context, e->jmp, num);
     } else {
         fprintf(stderr, "Throw with invalid jmp_buf: %s\n", e->msg);
         abort();
@@ -224,7 +249,7 @@ void handlebars_throw_ex(struct handlebars_context * context, enum handlebars_er
     const bool do_throw = true;
 #endif
     if( e->jmp && do_throw ) {
-        longjmp(*e->jmp, num);
+        handlebars_longjmp(context, e->jmp, num);
     } else {
         fprintf(stderr, "Throw with invalid jmp_buf: %s\n", e->msg);
         abort();

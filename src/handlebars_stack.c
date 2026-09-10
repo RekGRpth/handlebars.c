@@ -60,9 +60,6 @@ struct handlebars_stack {
     struct handlebars_value v[];
 };
 
-void * HANDLEBARS_STACK_ALLOC_PTR = NULL;
-size_t HANDLEBARS_STACK_ALLOC_CAPACITY = 0;
-
 size_t handlebars_stack_size(size_t capacity) {
     const size_t max_values = (SIZE_MAX - sizeof(struct handlebars_stack)) / sizeof(struct handlebars_value);
 
@@ -97,11 +94,39 @@ void handlebars_stack_delref(struct handlebars_stack * stack)
 #endif
 }
 
-static inline struct handlebars_stack * stack_separate(struct handlebars_stack * stack) {
+struct handlebars_context * handlebars_stack_get_context(struct handlebars_stack * stack)
+{
+    return stack->ctx;
+}
+
+bool handlebars_stack_is_shared(
+    struct handlebars_stack * stack,
+    size_t expected_references
+) {
 #ifndef HANDLEBARS_NO_REFCOUNT
-    if (handlebars_rc_refcount(&stack->rc) > 1) {
-        // Cannot resize if this stack was stack allocated
-        if( unlikely(!(stack->flags & HANDLEBARS_STACK_TALLOCATED)) ) {
+    return handlebars_rc_refcount(&stack->rc) > expected_references;
+#else
+    (void) stack;
+    (void) expected_references;
+    return false;
+#endif
+}
+
+static inline struct handlebars_stack * stack_separate_ex(
+    struct handlebars_stack * stack,
+    size_t expected_references,
+    bool force_separate
+) {
+#ifndef HANDLEBARS_NO_REFCOUNT
+    if( force_separate ||
+        handlebars_rc_refcount(&stack->rc) > expected_references ) {
+        /* Ordinary mutations preserve the caller-backed copy-on-write
+         * restriction. Conversion can force a heap copy when inherited
+         * sharing guarantees that another owner retains the old stack. */
+        if( unlikely(
+            !force_separate &&
+            !(stack->flags & HANDLEBARS_STACK_TALLOCATED)
+        ) ) {
             handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Stack overflow");
         }
         struct handlebars_stack * prev_stack = stack;
@@ -109,9 +134,18 @@ static inline struct handlebars_stack * stack_separate(struct handlebars_stack *
         handlebars_stack_delref(prev_stack);
         handlebars_stack_addref(stack);
     }
+#else
+    (void) expected_references;
+    (void) force_separate;
 #endif
 
     return stack;
+}
+
+static inline struct handlebars_stack * stack_separate(
+    struct handlebars_stack * stack
+) {
+    return stack_separate_ex(stack, 1, false);
 }
 
 // }}} Reference Counting
@@ -201,6 +235,7 @@ static void handlebars_stack_dump(struct handlebars_stack * stack) {
 
 struct handlebars_stack * handlebars_stack_push(struct handlebars_stack * stack, struct handlebars_value * value)
 {
+    struct handlebars_stack * prev_stack = NULL;
     struct handlebars_value value_copy;
 
     assert(stack != NULL);
@@ -230,15 +265,20 @@ struct handlebars_stack * handlebars_stack_push(struct handlebars_stack * stack,
         if( unlikely(capacity <= stack->capacity || handlebars_stack_size(capacity) == 0) ) {
             handlebars_throw(stack->ctx, HANDLEBARS_STACK_OVERFLOW, "Stack capacity is too large: %zu", stack->capacity);
         }
-        struct handlebars_stack * prev_stack = stack;
+        prev_stack = stack;
         stack = handlebars_stack_copy_ctor(prev_stack, capacity);
-        handlebars_stack_delref(prev_stack);
         handlebars_stack_addref(stack);
     }
 
     handlebars_value_init(&stack->v[stack->i]);
     handlebars_value_value(&stack->v[stack->i], &value_copy);
     stack->i++;
+
+    /* A self-alias in value_copy may be the last owner of prev_stack. Keep
+     * that stack alive until the appended value has retained its payload. */
+    if( unlikely(prev_stack != NULL) ) {
+        handlebars_stack_delref(prev_stack);
+    }
 
     return stack;
 }
@@ -285,8 +325,13 @@ struct handlebars_value * handlebars_stack_get(struct handlebars_stack * stack, 
     return &stack->v[offset];
 }
 
-struct handlebars_stack * handlebars_stack_set(struct handlebars_stack * stack, size_t offset, struct handlebars_value * value)
-{
+struct handlebars_stack * handlebars_stack_set_internal(
+    struct handlebars_stack * stack,
+    size_t offset,
+    struct handlebars_value * value,
+    size_t expected_references,
+    bool force_separate
+) {
     assert(value != NULL);
 
     // As a special case, push
@@ -310,11 +355,20 @@ struct handlebars_stack * handlebars_stack_set(struct handlebars_stack * stack, 
     }
 
     // Separate if refcount > 1
-    stack = stack_separate(stack);
+    stack = stack_separate_ex(
+        stack,
+        expected_references,
+        force_separate
+    );
 
     handlebars_value_value(&stack->v[offset], value);
 
     return stack;
+}
+
+struct handlebars_stack * handlebars_stack_set(struct handlebars_stack * stack, size_t offset, struct handlebars_value * value)
+{
+    return handlebars_stack_set_internal(stack, offset, value, 1, false);
 }
 
 size_t handlebars_stack_protect(

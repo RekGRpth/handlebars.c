@@ -21,6 +21,9 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <float.h>
+#include <locale.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,6 +112,270 @@ static size_t string_length_add(
     return left + right;
 }
 
+static bool handlebars_string_parse_number_bytes(
+    struct handlebars_context * context,
+    const char * source,
+    size_t length,
+    double * value
+) {
+    const char * decimal_point = localeconv()->decimal_point;
+    size_t decimal_length = strlen(decimal_point);
+    size_t dot_count = 0;
+    size_t translated_length;
+    char * translated;
+    char * target;
+    char * end;
+    bool parsed;
+
+    if( decimal_length == 0 ) {
+        decimal_point = ".";
+        decimal_length = 1;
+    }
+    if( decimal_length == 1 && decimal_point[0] == '.' ) {
+        *value = strtod(source, &end);
+        return end == source + length;
+    }
+
+    for( size_t i = 0; i < length; i++ ) {
+        if( source[i] == '.' ) {
+            dot_count++;
+        }
+    }
+    if( decimal_length > 1
+            && dot_count > (SIZE_MAX - length) / (decimal_length - 1) ) {
+        handlebars_throw(context, HANDLEBARS_NOMEM, "Numeric literal is too large");
+    }
+    translated_length = length + dot_count * (decimal_length - 1);
+    if( unlikely(translated_length == SIZE_MAX) ) {
+        handlebars_throw(context, HANDLEBARS_NOMEM, "Numeric literal is too large");
+    }
+
+    translated = handlebars_talloc_size(context, translated_length + 1);
+    HANDLEBARS_MEMCHECK(translated, context);
+    target = translated;
+    for( size_t i = 0; i < length; i++ ) {
+        if( source[i] == '.' ) {
+            memcpy(target, decimal_point, decimal_length);
+            target += decimal_length;
+        } else {
+            *target++ = source[i];
+        }
+    }
+    *target = '\0';
+
+    *value = strtod(translated, &end);
+    parsed = end == translated + translated_length;
+    handlebars_talloc_free(translated);
+    return parsed;
+}
+
+bool handlebars_string_parse_number(
+    struct handlebars_context * context,
+    const struct handlebars_string * string,
+    double * value
+) {
+    return handlebars_string_parse_number_bytes(
+        context,
+        hbs_str_val(string),
+        hbs_str_len(string),
+        value
+    );
+}
+
+static struct handlebars_string * handlebars_string_normalize_decimal_point(
+    struct handlebars_string * string
+) {
+    const char * decimal_point = localeconv()->decimal_point;
+    size_t decimal_length = strlen(decimal_point);
+
+    if( decimal_length == 0
+            || (decimal_length == 1 && decimal_point[0] == '.') ) {
+        return string;
+    }
+    return handlebars_str_reduce(
+        string,
+        decimal_point,
+        decimal_length,
+        HBS_STRL(".")
+    );
+}
+
+#ifdef DBL_DECIMAL_DIG
+#define HANDLEBARS_DBL_DECIMAL_DIG DBL_DECIMAL_DIG
+#elif defined(DECIMAL_DIG)
+#define HANDLEBARS_DBL_DECIMAL_DIG DECIMAL_DIG
+#else
+#define HANDLEBARS_DBL_DECIMAL_DIG (DBL_DIG + 3)
+#endif
+
+static struct handlebars_string * handlebars_string_canonicalize_double(
+    struct handlebars_context * context,
+    struct handlebars_string * string
+) {
+    char digits[HANDLEBARS_DBL_DECIMAL_DIG + 1];
+    const char * source = hbs_str_val(string);
+    size_t length = hbs_str_len(string);
+    size_t position = 0;
+    size_t digit_count = 0;
+    size_t digits_before_point = 0;
+    size_t leading_zero_count = 0;
+    int exponent = 0;
+    int exponent_sign = 1;
+    int decimal_position;
+    bool negative = false;
+    bool saw_point = false;
+    struct handlebars_string * result;
+
+    if( position < length && source[position] == '-' ) {
+        negative = true;
+        position++;
+    }
+    while( position < length && source[position] != 'e' && source[position] != 'E' ) {
+        if( source[position] == '.' ) {
+            if( saw_point ) {
+                return string;
+            }
+            saw_point = true;
+            position++;
+            continue;
+        }
+        if( source[position] < '0' || source[position] > '9'
+                || digit_count >= HANDLEBARS_DBL_DECIMAL_DIG ) {
+            return string;
+        }
+        digits[digit_count++] = source[position++];
+        if( !saw_point ) {
+            digits_before_point++;
+        }
+    }
+    if( digit_count == 0 ) {
+        return string;
+    }
+    if( position < length ) {
+        position++;
+        if( position < length && (source[position] == '+' || source[position] == '-') ) {
+            if( source[position] == '-' ) {
+                exponent_sign = -1;
+            }
+            position++;
+        }
+        if( position == length ) {
+            return string;
+        }
+        while( position < length ) {
+            if( source[position] < '0' || source[position] > '9' ) {
+                return string;
+            }
+            exponent = exponent * 10 + source[position++] - '0';
+            if( exponent > 10000 ) {
+                return string;
+            }
+        }
+    }
+    exponent *= exponent_sign;
+
+    while( leading_zero_count + 1 < digit_count
+            && digits[leading_zero_count] == '0' ) {
+        leading_zero_count++;
+    }
+    if( leading_zero_count > 0 ) {
+        memmove(digits, digits + leading_zero_count, digit_count - leading_zero_count);
+        digit_count -= leading_zero_count;
+    }
+    while( digit_count > 1 && digits[digit_count - 1] == '0' ) {
+        digit_count--;
+    }
+    decimal_position = (int) digits_before_point
+        - (int) leading_zero_count
+        + exponent;
+
+    result = handlebars_string_init(context, digit_count + 24);
+    if( negative ) {
+        result = handlebars_string_append(context, result, HBS_STRL("-"));
+    }
+    if( decimal_position > 0 && decimal_position <= 21 ) {
+        size_t whole_digits = (size_t) decimal_position;
+
+        if( digit_count <= whole_digits ) {
+            result = handlebars_string_append(context, result, digits, digit_count);
+            for( size_t i = digit_count; i < whole_digits; i++ ) {
+                result = handlebars_string_append(context, result, HBS_STRL("0"));
+            }
+        } else {
+            result = handlebars_string_append(context, result, digits, whole_digits);
+            result = handlebars_string_append(context, result, HBS_STRL("."));
+            result = handlebars_string_append(
+                context,
+                result,
+                digits + whole_digits,
+                digit_count - whole_digits
+            );
+        }
+    } else if( decimal_position <= 0 && decimal_position > -6 ) {
+        result = handlebars_string_append(context, result, HBS_STRL("0."));
+        for( int i = 0; i < -decimal_position; i++ ) {
+            result = handlebars_string_append(context, result, HBS_STRL("0"));
+        }
+        result = handlebars_string_append(context, result, digits, digit_count);
+    } else {
+        result = handlebars_string_append(context, result, digits, 1);
+        if( digit_count > 1 ) {
+            result = handlebars_string_append(context, result, HBS_STRL("."));
+            result = handlebars_string_append(
+                context,
+                result,
+                digits + 1,
+                digit_count - 1
+            );
+        }
+        result = handlebars_string_asprintf_append(
+            context,
+            result,
+            "e%+d",
+            decimal_position - 1
+        );
+    }
+
+    handlebars_talloc_free(string);
+    return result;
+}
+
+struct handlebars_string * handlebars_string_from_double(
+    struct handlebars_context * context,
+    double value
+) {
+    struct handlebars_string * string = NULL;
+
+    if( isnan(value) ) {
+        return handlebars_string_ctor(context, HBS_STRL("NaN"));
+    }
+    if( isinf(value) ) {
+        return value < 0.0
+            ? handlebars_string_ctor(context, HBS_STRL("-Infinity"))
+            : handlebars_string_ctor(context, HBS_STRL("Infinity"));
+    }
+    if( value == 0.0 ) {
+        return handlebars_string_ctor(context, HBS_STRL("0"));
+    }
+
+    for( int precision = 1; precision <= HANDLEBARS_DBL_DECIMAL_DIG; precision++ ) {
+        double parsed;
+
+        if( string != NULL ) {
+            handlebars_talloc_free(string);
+        }
+        string = handlebars_string_asprintf(context, "%.*g", precision, value);
+        string = handlebars_string_normalize_decimal_point(string);
+        if( handlebars_string_parse_number(context, string, &parsed)
+                && value == parsed ) {
+            break;
+        }
+    }
+    return handlebars_string_canonicalize_double(context, string);
+}
+
+#undef HANDLEBARS_DBL_DECIMAL_DIG
+
 static bool string_source_offset(
     const struct handlebars_string * string,
     const char * source,
@@ -136,11 +403,11 @@ static bool string_source_offset(
 
 // {{{ Accessors
 
-char * hbs_str_val(struct handlebars_string * str) {
+const char * hbs_str_val(const struct handlebars_string * str) {
     return str->val;
 }
 
-size_t hbs_str_len(struct handlebars_string * str) {
+size_t hbs_str_len(const struct handlebars_string * str) {
     return str->len;
 }
 
@@ -169,10 +436,7 @@ uint32_t handlebars_hash_djbx33a(const char * str, size_t len)
 
 uint64_t handlebars_hash_xxh3(const char * str, size_t len)
 {
-    XXH3_state_t state;
-    XXH3_64bits_reset(&state);
-    XXH3_64bits_update(&state, str, len);
-    return XXH3_64bits_digest(&state);
+    return XXH3_64bits(str, len);
 }
 
 uint32_t handlebars_hash_xxh3low(const char * str, size_t len)
@@ -330,6 +594,7 @@ struct handlebars_string * handlebars_string_copy_ctor(
     return st;
 }
 
+#ifndef HANDLEBARS_NO_REFCOUNT
 static struct handlebars_string * string_copy_for_capacity(
     struct handlebars_context * context,
     const struct handlebars_string * string,
@@ -349,9 +614,7 @@ static struct handlebars_string * string_copy_for_capacity(
     HANDLEBARS_MEMCHECK(copy, context);
     talloc_set_type(copy, struct handlebars_string);
     memcpy(copy, string, used_size);
-#ifndef HANDLEBARS_NO_REFCOUNT
     handlebars_rc_init(&copy->rc);
-#endif
     return copy;
 }
 
@@ -359,16 +622,13 @@ static struct handlebars_string * string_take_copy(
     struct handlebars_string * string,
     struct handlebars_string * copy
 ) {
-#ifndef HANDLEBARS_NO_REFCOUNT
     if( handlebars_rc_refcount(&string->rc) >= 1 ) {
         handlebars_string_addref(copy);
     }
     handlebars_string_delref(string);
-#else
-    handlebars_talloc_free(string);
-#endif
     return copy;
 }
+#endif
 
 static struct handlebars_string * string_reserve_for_write(
     struct handlebars_context * context,
@@ -565,10 +825,6 @@ struct handlebars_string * handlebars_str_replace(
     const char * last_tok = string->val;
     struct handlebars_string * new_string;
     size_t new_len = 0;
-
-    if( search_len <= 0 || string->len <= 0 ) {
-        return (struct handlebars_string *) string;
-    }
 
     // Calculate the exact output size before allocating. Besides making the
     // arithmetic checkable, this avoids reallocating once per expanding match.
@@ -959,16 +1215,16 @@ struct handlebars_string * handlebars_string_indent_append(
     struct handlebars_string * input_string,
     const struct handlebars_string * indent_str
 ) {
-    bool copied_input = append_to_string == input_string;
+    bool input_is_output = append_to_string == input_string;
+    bool indent_is_output = append_to_string == indent_str;
     const char * str;
+    const char * indent;
     size_t str_len;
+    size_t indent_len = indent_str->len;
+    size_t added_len;
+    size_t new_len;
     bool endsInLine;
     size_t i;
-    char tmp[2] = "\0";
-
-    if( copied_input ) {
-        input_string = handlebars_string_copy_ctor(context, input_string);
-    }
 
     str = input_string->val;
     str_len = input_string->len;
@@ -978,25 +1234,57 @@ struct handlebars_string * handlebars_string_indent_append(
         str_len--;
     }
 
-    append_to_string = handlebars_string_append_str(context, append_to_string, indent_str);
+    added_len = string_length_add(context, input_string->len, indent_len);
+    for( i = 0; i < str_len; i++ ) {
+        if( str[i] == '\n' ) {
+            added_len = string_length_add(context, added_len, indent_len);
+        }
+    }
+    new_len = string_length_add(context, append_to_string->len, added_len);
+    append_to_string = string_reserve_for_write(
+        context,
+        append_to_string,
+        new_len
+    );
+
+    if( input_is_output ) {
+        str = append_to_string->val;
+    }
+    indent = indent_is_output ? append_to_string->val : indent_str->val;
+    append_to_string = handlebars_string_append_unsafe(
+        append_to_string,
+        indent,
+        indent_len
+    );
 
     for( i = 0; i < str_len; i++ ) {
         if( str[i] == '\n' ) {
-            append_to_string = handlebars_string_append(context, append_to_string, HBS_STRL("\n"));
-            append_to_string = handlebars_string_append_str(context, append_to_string, indent_str);
+            append_to_string = handlebars_string_append_unsafe(
+                append_to_string,
+                HBS_STRL("\n")
+            );
+            append_to_string = handlebars_string_append_unsafe(
+                append_to_string,
+                indent,
+                indent_len
+            );
         } else {
-            tmp[0] = str[i];
-            append_to_string = handlebars_string_append(context, append_to_string, tmp, 1);
+            append_to_string = handlebars_string_append_unsafe(
+                append_to_string,
+                &str[i],
+                1
+            );
         }
     }
 
     if( endsInLine ) {
-        append_to_string = handlebars_string_append(context, append_to_string, HBS_STRL("\n"));
+        append_to_string = handlebars_string_append_unsafe(
+            append_to_string,
+            HBS_STRL("\n")
+        );
     }
 
-    if( copied_input ) {
-        handlebars_talloc_free(input_string);
-    } else {
+    if( !input_is_output ) {
         handlebars_string_delref(input_string);
     }
 
@@ -1031,6 +1319,7 @@ struct handlebars_string * handlebars_string_ltrim(struct handlebars_string * st
 
     if( ptr > string->val ) {
         memmove(string->val, ptr, string->len + 1);
+        string->hash = 0;
     }
 
     return string;
@@ -1039,6 +1328,7 @@ struct handlebars_string * handlebars_string_ltrim(struct handlebars_string * st
 struct handlebars_string * handlebars_string_rtrim(struct handlebars_string * string, const char * what, size_t what_length)
 {
     size_t i;
+    size_t original_len;
     char flags[256];
     char * original;
 
@@ -1049,6 +1339,7 @@ struct handlebars_string * handlebars_string_rtrim(struct handlebars_string * st
     }
 
     string = separate_string(string);
+    original_len = string->len;
 
     // Make char mask
     memset(flags, 0, sizeof(flags));
@@ -1060,6 +1351,10 @@ struct handlebars_string * handlebars_string_rtrim(struct handlebars_string * st
     while( original > string->val && flags[(unsigned char) *--original] ) {
         --string->len;
         *original = '\0';
+    }
+
+    if( string->len != original_len ) {
+        string->hash = 0;
     }
 
     return string;

@@ -20,6 +20,7 @@
 #endif
 
 #include <assert.h>
+#include <math.h>
 #include <string.h>
 
 #include "handlebars.h"
@@ -33,6 +34,7 @@
 #include "handlebars_stack.h"
 #include "handlebars_string.h"
 #include "handlebars_value.h"
+#include "handlebars_value_handlers.h"
 #include "handlebars_vm.h"
 
 #pragma GCC diagnostic push
@@ -60,63 +62,139 @@ void handlebars_options_deinit(struct handlebars_options * options)
     }
 }
 
-struct handlebars_value * handlebars_builtin_each(HANDLEBARS_HELPER_ARGS)
-{
+struct handlebars_each_call_state {
+    int argc;
+    struct handlebars_options * options;
+    struct handlebars_value * rv;
     struct handlebars_value * context;
-    struct handlebars_string * result_str = handlebars_string_ctor(CONTEXT, HBS_STRL(""));
+    size_t iteration;
+    struct handlebars_value rv2;
+    struct handlebars_value index;
+    struct handlebars_value key;
+    struct handlebars_value first;
+    struct handlebars_value last;
+    struct handlebars_value data;
+    struct handlebars_value block_params;
+    struct handlebars_value lambda_argv[1];
+    struct handlebars_string * result;
+    struct handlebars_string * nested_result;
+    struct handlebars_map * data_map;
+    struct handlebars_vm_call_checkpoint checkpoint;
+    size_t data_proxy_count;
+};
+
+static void handlebars_each_call_state_deinit(
+    struct handlebars_each_call_state * state
+)
+{
+    if( state->nested_result != NULL ) {
+        handlebars_string_delref(state->nested_result);
+    }
+    if( state->result != NULL ) {
+        handlebars_string_delref(state->result);
+    }
+    if( state->data_map != NULL ) {
+        handlebars_map_delref(state->data_map);
+    }
+    handlebars_value_dtor(&state->lambda_argv[0]);
+    handlebars_value_dtor(&state->block_params);
+    handlebars_value_dtor(&state->data);
+    handlebars_value_dtor(&state->last);
+    handlebars_value_dtor(&state->first);
+    handlebars_value_dtor(&state->key);
+    handlebars_value_dtor(&state->index);
+    handlebars_value_dtor(&state->rv2);
+}
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void handlebars_builtin_each_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_each_call_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
     short use_data;
-    struct handlebars_string * tmp;
-    size_t i = 0;
     size_t len;
-    HANDLEBARS_VALUE_DECL(rv2);
-    HANDLEBARS_VALUE_DECL(index);
-    HANDLEBARS_VALUE_DECL(key);
-    HANDLEBARS_VALUE_DECL(first);
-    HANDLEBARS_VALUE_DECL(last);
-    HANDLEBARS_VALUE_DECL(data);
-    HANDLEBARS_VALUE_DECL(block_params);
-    struct handlebars_map * data_map = NULL;
+    jmp_buf buf;
 
-    use_data = (options->data != NULL);
+    state->data_proxy_count = vm->data_proxy_count;
 
-    if( argc < 1 ) {
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
+
+    handlebars_vm_call_checkpoint_begin(vm, &state->checkpoint);
+
+    if( state->argc < 1 ) {
         handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Must pass iterator to #each");
     }
 
-    context = &argv[0];
+    state->result = handlebars_string_ctor(CONTEXT, HBS_STRL(""));
+    use_data = (state->options->data != NULL);
 
-    if( handlebars_value_is_callable(context) ) {
+    if( handlebars_value_is_callable(state->context) ) {
         const int argc2 = 1;
-        HANDLEBARS_VALUE_ARRAY_DECL(argv2, argc2);
-        handlebars_value_value(&argv2[0], options->scope);
-        context = handlebars_value_call(context, argc2, argv2, options, vm, rv2);
-        HANDLEBARS_VALUE_ARRAY_UNDECL(argv2, argc2);
+        handlebars_value_value(
+            &state->lambda_argv[0],
+            state->options->scope
+        );
+        state->context = handlebars_value_call(
+            state->context,
+            argc2,
+            state->lambda_argv,
+            state->options,
+            vm,
+            &state->rv2
+        );
     }
 
-    if( handlebars_value_get_type(context) != HANDLEBARS_VALUE_TYPE_MAP && handlebars_value_get_type(context) != HANDLEBARS_VALUE_TYPE_ARRAY ) {
-        use_data = false;
+    if( handlebars_value_get_type(state->context) != HANDLEBARS_VALUE_TYPE_MAP
+            && handlebars_value_get_type(state->context) != HANDLEBARS_VALUE_TYPE_ARRAY ) {
         goto whoopsie;
     }
 
     if( use_data ) {
-        handlebars_value_array(block_params, handlebars_stack_ctor(CONTEXT, 2));
+        handlebars_value_array(
+            &state->block_params,
+            handlebars_stack_ctor(CONTEXT, 2)
+        );
 
-        if( handlebars_value_get_type(options->data) == HANDLEBARS_VALUE_TYPE_MAP ) {
-            data_map = handlebars_map_ctor(CONTEXT, handlebars_value_count(options->data) + 4);
-            HANDLEBARS_VALUE_FOREACH_KV(options->data, options_key, child) {
-                data_map = handlebars_map_update(data_map, options_key, child);
+        if( state->options->data->type == HANDLEBARS_VALUE_TYPE_MAP ) {
+            state->data_map = handlebars_map_ctor(
+                CONTEXT,
+                handlebars_value_count(state->options->data) + 5
+            );
+            HANDLEBARS_VALUE_FOREACH_KV(state->options->data, options_key, child) {
+                state->data_map = handlebars_map_update(
+                    state->data_map,
+                    options_key,
+                    child
+                );
             } HANDLEBARS_VALUE_FOREACH_END();
         } else {
-            data_map = handlebars_map_ctor(CONTEXT, 4);
+            state->data_map = handlebars_map_ctor(CONTEXT, 5);
         }
-        handlebars_map_addref(data_map);
+        state->data_map = handlebars_map_str_update(
+            state->data_map,
+            HBS_STRL("_parent"),
+            state->options->data
+        );
+        handlebars_vm_register_data_proxy(
+            vm,
+            state->data_map,
+            state->options->data
+        );
+        handlebars_map_addref(state->data_map);
     }
 
-    len = handlebars_value_count(context);
+    len = handlebars_value_count(state->context);
     if (len <= 0) goto whoopsie;
     len--;
 
-    HANDLEBARS_VALUE_FOREACH_IDX_KV(context, it_index, it_key, it_child) {
+    HANDLEBARS_VALUE_FOREACH_IDX_KV(state->context, it_index, it_key, it_child) {
         // Disabled for Regressions - Undefined helper context
         // if( it.current->type == HANDLEBARS_VALUE_TYPE_NULL ) {
         //     i++;
@@ -124,58 +202,112 @@ struct handlebars_value * handlebars_builtin_each(HANDLEBARS_HELPER_ARGS)
         // }
 
         if( it_key /*it->value->type == HANDLEBARS_VALUE_TYPE_MAP*/ ) {
-            handlebars_value_str(key, it_key);
+            handlebars_value_str(&state->key, it_key);
         } else {
-            handlebars_value_integer(key, it_index);
+            handlebars_value_integer(&state->key, it_index);
         }
 
-        if( use_data && data_map ) {
+        if( use_data && state->data_map ) {
             if( it_index ) {
-                handlebars_value_integer(index, it_index);
+                handlebars_value_integer(&state->index, it_index);
             } else {
-                handlebars_value_integer(index, i);
+                handlebars_value_integer(&state->index, state->iteration);
             }
-            handlebars_value_boolean(first, i == 0);
-            handlebars_value_boolean(last, i == len);
+            handlebars_value_boolean(
+                &state->first,
+                state->iteration == 0
+            );
+            handlebars_value_boolean(
+                &state->last,
+                state->iteration == len
+            );
 
-            handlebars_value_array_set(block_params, 0, it_child);
-            handlebars_value_array_set(block_params, 1, key);
+            handlebars_value_array_set(&state->block_params, 0, it_child);
+            handlebars_value_array_set(&state->block_params, 1, &state->key);
 
-            data_map = handlebars_map_str_update(data_map, HBS_STRL("index"), index);
-            data_map = handlebars_map_str_update(data_map, HBS_STRL("key"), key);
-            data_map = handlebars_map_str_update(data_map, HBS_STRL("first"), first);
-            data_map = handlebars_map_str_update(data_map, HBS_STRL("last"), last);
-            handlebars_value_map(data, data_map);
+            state->data_map = handlebars_map_str_update(
+                state->data_map,
+                HBS_STRL("index"),
+                &state->index
+            );
+            state->data_map = handlebars_map_str_update(
+                state->data_map,
+                HBS_STRL("key"),
+                &state->key
+            );
+            state->data_map = handlebars_map_str_update(
+                state->data_map,
+                HBS_STRL("first"),
+                &state->first
+            );
+            state->data_map = handlebars_map_str_update(
+                state->data_map,
+                HBS_STRL("last"),
+                &state->last
+            );
+            handlebars_value_map(&state->data, state->data_map);
         }
 
-        tmp = handlebars_vm_execute_program_ex(vm, options->program, it_child, data, block_params);
-        result_str = handlebars_string_append(HBSCTX(vm), result_str, HBS_STR_STRL(tmp));
+        state->nested_result = handlebars_vm_execute_program_ex(
+            vm,
+            state->options->program,
+            it_child,
+            &state->data,
+            &state->block_params
+        );
+        state->result = handlebars_string_append(
+            HBSCTX(vm),
+            state->result,
+            HBS_STR_STRL(state->nested_result)
+        );
+        handlebars_string_delref(state->nested_result);
+        state->nested_result = NULL;
 
-        handlebars_value_null(data);
+        handlebars_value_null(&state->data);
 
-        i++;
+        state->iteration++;
     } HANDLEBARS_VALUE_FOREACH_END();
 
 whoopsie:
-    if( i == 0 ) {
-        tmp = handlebars_vm_execute_program(vm, options->inverse, options->scope);
-        assert(tmp != NULL);
-        result_str = handlebars_string_append(HBSCTX(vm), result_str, HBS_STR_STRL(tmp));
+    if( state->iteration == 0 ) {
+        state->nested_result = handlebars_vm_execute_program(
+            vm,
+            state->options->inverse,
+            state->options->scope
+        );
+        assert(state->nested_result != NULL);
+        state->result = handlebars_string_append(
+            HBSCTX(vm),
+            state->result,
+            HBS_STR_STRL(state->nested_result)
+        );
+        handlebars_string_delref(state->nested_result);
+        state->nested_result = NULL;
     }
 
-    handlebars_value_str(rv, result_str);
+    handlebars_value_str(state->rv, state->result);
+    state->result = NULL;
 
-    if( use_data && data_map ) {
-        handlebars_map_delref(data_map);
+done:
+    error->jmp = prev_jmp;
+    vm->data_proxy_count = state->data_proxy_count;
+    handlebars_vm_call_checkpoint_finish(vm, &state->checkpoint, caught);
+    handlebars_each_call_state_deinit(state);
+
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, prev_jmp, caught);
     }
+}
 
-    HANDLEBARS_VALUE_UNDECL(rv2);
-    HANDLEBARS_VALUE_UNDECL(block_params);
-    HANDLEBARS_VALUE_UNDECL(data);
-    HANDLEBARS_VALUE_UNDECL(last);
-    HANDLEBARS_VALUE_UNDECL(first);
-    HANDLEBARS_VALUE_UNDECL(key);
-    HANDLEBARS_VALUE_UNDECL(index);
+struct handlebars_value * handlebars_builtin_each(HANDLEBARS_HELPER_ARGS)
+{
+    struct handlebars_each_call_state state = {0};
+
+    state.argc = argc;
+    state.options = options;
+    state.rv = rv;
+    state.context = argc > 0 ? argv : NULL;
+    handlebars_builtin_each_guarded(vm, &state);
 
     return rv;
 }
@@ -256,109 +388,289 @@ struct handlebars_value * handlebars_builtin_lookup(HANDLEBARS_HELPER_ARGS)
 
     struct handlebars_value * context = &argv[0];
     struct handlebars_value * field = &argv[1];
-    enum handlebars_value_type type = handlebars_value_get_type(context);
+    struct handlebars_string * key = handlebars_value_to_string(field, CONTEXT);
+    struct handlebars_value * result;
 
-    if( type == HANDLEBARS_VALUE_TYPE_MAP ) {
-        struct handlebars_string * key = handlebars_value_to_string(field, CONTEXT);
-        (void) handlebars_value_map_find(context, key, rv);
-        handlebars_string_delref(key);
-    } else if( type == HANDLEBARS_VALUE_TYPE_ARRAY ) {
-        // @todo sscanf?
-        if( handlebars_value_get_type(field) == HANDLEBARS_VALUE_TYPE_INTEGER ) {
-            rv = handlebars_value_array_find(context, handlebars_value_get_intval(field), rv);
+    result = handlebars_vm_lookup_property(vm, context, key, rv);
+    handlebars_string_delref(key);
+
+    return result != NULL ? result : rv;
+}
+
+/* Handlebars emptiness differs from the general value conversion API. */
+static bool handlebars_conditional_is_empty(
+    struct handlebars_value * value,
+    bool include_zero
+)
+{
+    switch( handlebars_value_get_type(value) ) {
+        case HANDLEBARS_VALUE_TYPE_NULL:
+        case HANDLEBARS_VALUE_TYPE_FALSE:
+            return true;
+        case HANDLEBARS_VALUE_TYPE_INTEGER:
+            return !include_zero && handlebars_value_get_intval(value) == 0;
+        case HANDLEBARS_VALUE_TYPE_FLOAT: {
+            double number = handlebars_value_get_floatval(value);
+            return isnan(number) || (!include_zero && number == 0);
         }
+        case HANDLEBARS_VALUE_TYPE_STRING:
+            if( handlebars_value_get_real_type(value) == HANDLEBARS_VALUE_TYPE_USER ) {
+                if( handlebars_value_get_handlers(value)->count == NULL ) {
+                    /* Keep custom strings truthy when their length is unavailable. */
+                    return false;
+                }
+                return handlebars_value_count(value) == 0;
+            }
+            return handlebars_value_get_strlen(value) == 0;
+        case HANDLEBARS_VALUE_TYPE_ARRAY:
+            if( handlebars_value_get_real_type(value) == HANDLEBARS_VALUE_TYPE_USER &&
+                    handlebars_value_get_handlers(value)->count == NULL ) {
+                /* Keep lazy arrays truthy when their length is unavailable. */
+                return false;
+            }
+            return handlebars_value_count(value) == 0;
+        default:
+            return false;
+    }
+}
+
+struct handlebars_if_call_state {
+    int argc;
+    struct handlebars_options * options;
+    struct handlebars_value * rv;
+    struct handlebars_value * conditional;
+    struct handlebars_value rv2;
+    struct handlebars_value include_zero;
+    struct handlebars_value lambda_argv[1];
+    struct handlebars_vm_call_checkpoint checkpoint;
+};
+
+static void handlebars_if_call_state_deinit(
+    struct handlebars_if_call_state * state
+)
+{
+    handlebars_value_dtor(&state->lambda_argv[0]);
+    handlebars_value_dtor(&state->rv2);
+    handlebars_value_dtor(&state->include_zero);
+}
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void handlebars_builtin_if_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_if_call_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_value * conditional;
+    bool include_zero = false;
+    long program;
+    struct handlebars_string * result_str = NULL;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
     }
 
-    return rv;
+    handlebars_vm_call_checkpoint_begin(vm, &state->checkpoint);
+
+    if (state->argc != 1) {
+        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "#if requires exactly one argument");
+    }
+
+    conditional = state->conditional;
+    if( handlebars_value_is_callable(conditional) ) {
+        const int argc2 = 1;
+        handlebars_value_value(
+            &state->lambda_argv[0],
+            state->options->scope
+        );
+        conditional = handlebars_value_call(
+            conditional,
+            argc2,
+            state->lambda_argv,
+            state->options,
+            vm,
+            &state->rv2
+        );
+    }
+
+    if( state->options->hash != NULL ) {
+        struct handlebars_value * option = handlebars_value_map_str_find(
+            state->options->hash,
+            HBS_STRL("includeZero"),
+            &state->include_zero
+        );
+        if( option != NULL ) {
+            /* Arrays, including empty arrays, are truthy as option values. */
+            include_zero = handlebars_value_get_type(option) == HANDLEBARS_VALUE_TYPE_ARRAY ||
+                !handlebars_conditional_is_empty(option, false);
+        }
+    }
+    program = handlebars_conditional_is_empty(conditional, include_zero) ?
+        state->options->inverse : state->options->program;
+
+    result_str = handlebars_vm_execute_program(
+        vm,
+        program,
+        state->options->scope
+    );
+    handlebars_value_str(state->rv, result_str);
+
+done:
+    error->jmp = prev_jmp;
+    handlebars_vm_call_checkpoint_finish(vm, &state->checkpoint, caught);
+    handlebars_if_call_state_deinit(state);
+
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, prev_jmp, caught);
+    }
 }
 
 struct handlebars_value * handlebars_builtin_if(HANDLEBARS_HELPER_ARGS)
 {
-    struct handlebars_value * conditional = &argv[0];
-    long program;
-    struct handlebars_string * result_str = NULL;
-    HANDLEBARS_VALUE_DECL(rv2);
+    struct handlebars_if_call_state state = {0};
 
-    if (argc != 1) {
-        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "#if requires exactly one argument");
-    }
-
-    if( handlebars_value_is_callable(conditional) ) {
-        const int argc2 = 1;
-        HANDLEBARS_VALUE_ARRAY_DECL(argv2, argc2);
-        handlebars_value_value(&argv2[0], options->scope);
-        conditional = handlebars_value_call(conditional, argc2, argv2, options, vm, rv2);
-        HANDLEBARS_VALUE_ARRAY_UNDECL(argv2, argc2);
-    }
-
-    if( !handlebars_value_is_empty(conditional) ) {
-        program = options->program;
-    } else if( handlebars_value_get_type(conditional) == HANDLEBARS_VALUE_TYPE_INTEGER &&
-            handlebars_value_get_intval(conditional) == 0 &&
-            NULL != handlebars_value_map_str_find(options->hash, HBS_STRL("includeZero"), rv2) ) {
-        program = options->program;
-    } else {
-        program = options->inverse;
-    }
-
-    result_str = handlebars_vm_execute_program(vm, program, options->scope);
-    handlebars_value_str(rv, result_str);
-
-    HANDLEBARS_VALUE_UNDECL(rv2);
+    state.argc = argc;
+    state.options = options;
+    state.rv = rv;
+    state.conditional = argc > 0 ? argv : NULL;
+    handlebars_builtin_if_guarded(vm, &state);
 
     return rv;
 }
 
 struct handlebars_value * handlebars_builtin_unless(HANDLEBARS_HELPER_ARGS)
 {
-    struct handlebars_value * conditional;
-
     if (argc != 1) {
         handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "#unless requires exactly one argument");
     }
 
-    conditional = &argv[0];
-    assert(conditional != NULL);
+    struct handlebars_options inverted = *options;
+    inverted.program = options->inverse;
+    inverted.inverse = options->program;
+    inverted.program_block_params = handlebars_vm_program_block_params(
+        vm,
+        inverted.program
+    );
 
-    handlebars_value_boolean(conditional, handlebars_value_is_empty(conditional));
+    return handlebars_vm_call_helper_str(HBS_STRL("if"), argc, argv, &inverted, vm, rv);
+}
 
-    return handlebars_vm_call_helper_str(HBS_STRL("if"), HANDLEBARS_HELPER_ARGS_PASSTHRU);
+struct handlebars_with_call_state {
+    int argc;
+    struct handlebars_options * options;
+    struct handlebars_value * rv;
+    struct handlebars_value * context;
+    struct handlebars_value block_params;
+    struct handlebars_value rv2;
+    struct handlebars_value lambda_argv[1];
+    struct handlebars_string * result;
+    struct handlebars_vm_call_checkpoint checkpoint;
+};
+
+static void handlebars_with_call_state_deinit(
+    struct handlebars_with_call_state * state
+)
+{
+    if( state->result != NULL ) {
+        handlebars_string_delref(state->result);
+    }
+    handlebars_value_dtor(&state->lambda_argv[0]);
+    handlebars_value_dtor(&state->rv2);
+    handlebars_value_dtor(&state->block_params);
+}
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void handlebars_builtin_with_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_with_call_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
+
+    handlebars_vm_call_checkpoint_begin(vm, &state->checkpoint);
+
+    if (state->argc != 1) {
+        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "#with requires exactly one argument");
+    }
+
+    if( handlebars_value_is_callable(state->context) ) {
+        const int argc2 = 1;
+        handlebars_value_value(
+            &state->lambda_argv[0],
+            state->options->scope
+        );
+        state->context = handlebars_value_call(
+            state->context,
+            argc2,
+            state->lambda_argv,
+            state->options,
+            vm,
+            &state->rv2
+        );
+    }
+
+    assert(state->context != NULL);
+
+    if( handlebars_conditional_is_empty(state->context, true) ) {
+        state->result = handlebars_vm_execute_program(
+            vm,
+            state->options->inverse,
+            state->options->scope
+        );
+    } else {
+        handlebars_value_array(
+            &state->block_params,
+            handlebars_stack_ctor(CONTEXT, 2)
+        );
+        handlebars_value_array_set(
+            &state->block_params,
+            0,
+            state->context
+        );
+
+        state->result = handlebars_vm_execute_program_ex(
+            vm,
+            state->options->program,
+            state->context,
+            state->options->data,
+            &state->block_params
+        );
+    }
+
+    handlebars_value_str(state->rv, state->result);
+    state->result = NULL;
+
+done:
+    error->jmp = prev_jmp;
+    handlebars_vm_call_checkpoint_finish(vm, &state->checkpoint, caught);
+    handlebars_with_call_state_deinit(state);
+
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, prev_jmp, caught);
+    }
 }
 
 struct handlebars_value * handlebars_builtin_with(HANDLEBARS_HELPER_ARGS)
 {
-    struct handlebars_string * result_str = NULL;
-    struct handlebars_value * context = &argv[0];
-    HANDLEBARS_VALUE_DECL(block_params);
-    HANDLEBARS_VALUE_DECL(rv2);
+    struct handlebars_with_call_state state = {0};
 
-    if (argc != 1) {
-        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "#with requires exactly one argument");
-    }
-
-    if( handlebars_value_is_callable(context) ) {
-        const int argc2 = 1;
-        HANDLEBARS_VALUE_ARRAY_DECL(argv2, argc2);
-        handlebars_value_value(&argv2[0], options->scope);
-        context = handlebars_value_call(context, argc2, argv2, options, vm, rv2);
-        HANDLEBARS_VALUE_ARRAY_UNDECL(argv2, argc2);
-    }
-
-    assert(context != NULL);
-
-    if( handlebars_value_get_type(context) == HANDLEBARS_VALUE_TYPE_NULL ) {
-        result_str = handlebars_vm_execute_program(vm, options->inverse, context);
-    } else {
-        handlebars_value_array(block_params, handlebars_stack_ctor(CONTEXT, 2));
-        handlebars_value_array_set(block_params, 0, context);
-
-        result_str = handlebars_vm_execute_program_ex(vm, options->program, context, options->data, block_params);
-    }
-
-    handlebars_value_str(rv, result_str);
-
-    HANDLEBARS_VALUE_UNDECL(rv2);
-    HANDLEBARS_VALUE_UNDECL(block_params);
+    state.argc = argc;
+    state.options = options;
+    state.rv = rv;
+    state.context = argc > 0 ? argv : NULL;
+    handlebars_builtin_with_guarded(vm, &state);
 
     return rv;
 }

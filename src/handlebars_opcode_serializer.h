@@ -44,6 +44,23 @@ struct handlebars_module * handlebars_program_serialize(
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
 
 /**
+ * @brief Serialize a program without allowing an internal longjmp to escape.
+ *
+ * Clears the context's previous error. On failure, `*result` is NULL and any
+ * partially constructed module is released.
+ *
+ * @param[in] context The handlebars and talloc context
+ * @param[in] program The program to serialize
+ * @param[out] result Receives the context-owned module on success
+ * @return #HANDLEBARS_SUCCESS on success, otherwise the error code
+ */
+enum handlebars_error_type handlebars_program_serialize_try(
+    struct handlebars_context * context,
+    struct handlebars_program * program,
+    struct handlebars_module ** result
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
+
+/**
  * @brief Adjust pointers by the offset between the specified base address and handlebars_module#addr
  * @param[in] module
  * @return void
@@ -110,6 +127,8 @@ struct handlebars_module_table_entry
 {
     //! The unique ID of this program
     size_t guid;
+    //! Number of block parameters declared by this program
+    size_t block_params;
     //! Number of opcodes
     size_t opcode_count;
     //! Offset to start opcode for function

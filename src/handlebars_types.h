@@ -18,9 +18,13 @@
 #ifndef HANDLEBARS_TYPES_H
 #define HANDLEBARS_TYPES_H
 
+#include "handlebars.h"
+
 HBS_EXTERN_C_START
 
 struct handlebars_options;
+struct handlebars_string;
+struct handlebars_value;
 struct handlebars_vm;
 
 // {{{ value
@@ -49,7 +53,7 @@ enum handlebars_value_type
 enum handlebars_value_flags
 {
     HANDLEBARS_VALUE_FLAG_NONE = 0,
-    //! Indicates that the string value should not be escaped when appending to the output buffer
+    //! Indicates that the current string payload should not be escaped when appending to the output buffer
     HANDLEBARS_VALUE_FLAG_SAFE_STRING = 1
 };
 
@@ -106,6 +110,8 @@ struct handlebars_options {
     struct handlebars_value * scope;
     struct handlebars_value * data;
     struct handlebars_value * hash;
+    //! Number of block parameters declared by the child program
+    size_t program_block_params;
 };
 
 // }}} options

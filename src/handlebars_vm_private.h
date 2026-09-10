@@ -19,6 +19,7 @@
 #define HANDLEBARS_VM_PRIVATE_H
 
 #include "handlebars.h"
+#include "handlebars_stack.h"
 #include "handlebars_types.h"
 #include "handlebars_value_private.h"
 
@@ -28,6 +29,31 @@ struct handlebars_cache;
 struct handlebars_module;
 struct handlebars_string;
 struct handlebars_stack;
+struct handlebars_user;
+
+struct handlebars_vm_data_proxy {
+    struct handlebars_map * frame;
+    struct handlebars_user * source;
+    unsigned char flags;
+};
+
+HBS_LOCAL struct handlebars_value * handlebars_vm_lookup_property(
+    struct handlebars_vm * vm,
+    struct handlebars_value * value,
+    struct handlebars_string * key,
+    struct handlebars_value * rv
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL size_t handlebars_vm_program_block_params(
+    struct handlebars_vm * vm,
+    long program
+) HBS_ATTR_NONNULL(1);
+
+HBS_LOCAL void handlebars_vm_register_data_proxy(
+    struct handlebars_vm * vm,
+    struct handlebars_map * frame,
+    struct handlebars_value * parent
+) HBS_ATTR_NONNULL_ALL;
 
 struct handlebars_vm {
     struct handlebars_context ctx;
@@ -41,6 +67,10 @@ struct handlebars_vm {
     struct handlebars_string * buffer;
 
     struct handlebars_value data;
+    struct handlebars_value render_data;
+    struct handlebars_vm_data_proxy * data_proxies;
+    size_t data_proxy_count;
+    bool render_data_active;
     struct handlebars_value helpers;
     struct handlebars_value partials;
 
@@ -52,6 +82,7 @@ struct handlebars_vm {
     struct handlebars_stack * hashStack;
     struct handlebars_stack * blockParamStack;
     struct handlebars_stack * partialBlockStack;
+    struct handlebars_stack * partialScopeStack;
 
     handlebars_func log_func;
     void * log_ctx;
@@ -59,6 +90,57 @@ struct handlebars_vm {
     struct handlebars_string * delim_open;
     struct handlebars_string * delim_close;
 };
+
+/*
+ * A transactional snapshot around a potentially throwing VM call.
+ *
+ * The saved buffer is borrowed, rather than reference-counted. A checkpoint
+ * may span nested program execution, which temporarily installs its own
+ * buffer, but must be committed before directly replacing or mutating the
+ * outer buffer.
+ */
+struct handlebars_vm_call_checkpoint {
+    struct handlebars_stack_save_buf stack;
+    struct handlebars_stack_save_buf hash_stack;
+    struct handlebars_stack_save_buf context_stack;
+    struct handlebars_stack_save_buf block_param_stack;
+    struct handlebars_stack_save_buf partial_block_stack;
+    struct handlebars_stack_save_buf partial_scope_stack;
+    struct handlebars_value data;
+    struct handlebars_vm_data_proxy * data_proxy_snapshot;
+    size_t data_proxy_count;
+    struct handlebars_string * buffer;
+    long depth;
+    bool stacks_active;
+    bool open;
+};
+
+HBS_LOCAL void handlebars_vm_call_checkpoint_begin(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_call_checkpoint * checkpoint
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL void handlebars_vm_call_checkpoint_commit(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_call_checkpoint * checkpoint
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL void handlebars_vm_call_checkpoint_rollback(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_call_checkpoint * checkpoint
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL void handlebars_vm_call_checkpoint_finish(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_call_checkpoint * checkpoint,
+    enum handlebars_error_type result
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL HBS_ATTR_NORETURN void handlebars_vm_rethrow_caught(
+    struct handlebars_vm * vm,
+    jmp_buf * previous,
+    enum handlebars_error_type caught
+);
 
 HBS_EXTERN_C_END
 

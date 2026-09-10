@@ -25,6 +25,77 @@
 HBS_EXTERN_C_START
 
 struct handlebars_context;
+struct handlebars_error;
+struct handlebars_map;
+struct handlebars_stack;
+struct handlebars_string;
+struct handlebars_value;
+
+HBS_LOCAL bool handlebars_string_parse_number(
+    struct handlebars_context * context,
+    const struct handlebars_string * string,
+    double * value
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
+
+HBS_LOCAL struct handlebars_string * handlebars_string_from_double(
+    struct handlebars_context * context,
+    double value
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
+
+HBS_LOCAL struct handlebars_context * handlebars_map_get_context(
+    struct handlebars_map * map
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL;
+
+HBS_LOCAL bool handlebars_map_is_shared(
+    struct handlebars_map * map,
+    size_t expected_references
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL bool handlebars_map_iteration_acquire(
+    struct handlebars_map * map
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
+
+HBS_LOCAL void handlebars_map_iteration_release(
+    struct handlebars_map * map,
+    bool retained
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL struct handlebars_context * handlebars_stack_get_context(
+    struct handlebars_stack * stack
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL;
+
+HBS_LOCAL bool handlebars_stack_is_shared(
+    struct handlebars_stack * stack,
+    size_t expected_references
+) HBS_ATTR_NONNULL_ALL;
+
+/* Set an array slot while discounting references held only by an active value
+ * traversal. force_separate protects aliases inherited through an ancestor. */
+HBS_LOCAL struct handlebars_stack * handlebars_stack_set_internal(
+    struct handlebars_stack * stack,
+    size_t offset,
+    struct handlebars_value * value,
+    size_t expected_references,
+    bool force_separate
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL;
+
+HBS_LOCAL void handlebars_value_iterator_unwind(
+    struct handlebars_error * error,
+    jmp_buf * target
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL HBS_ATTR_NORETURN void handlebars_longjmp(
+    struct handlebars_context * context,
+    jmp_buf * target,
+    int num
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL void handlebars_error_set(
+    struct handlebars_context * context,
+    enum handlebars_error_type num,
+    const char * msg,
+    ...
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_PRINTF(3, 4);
 
 #define likely handlebars_likely
 #define unlikely handlebars_unlikely

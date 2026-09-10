@@ -19,12 +19,13 @@ m4_define([HANDLEBARS_MINOR], 0)
 m4_define([HANDLEBARS_PATCH], 0)
 
 # Define the libtool version numbers; check the Autobook, Section 11.4.
-m4_define([HANDLEBARS_CURRENT], 9)
+# v1.0.0 shipped 9:0:0; all changes in Unreleased collectively form ABI 10.
+m4_define([HANDLEBARS_CURRENT], 10)
 m4_define([HANDLEBARS_REVISION], 0)
 m4_define([HANDLEBARS_AGE], 0)
 
 # Define the version of the specs
-m4_define([HANDLEBARS_SPEC_VERSION], [4.7.7])
+m4_define([HANDLEBARS_SPEC_VERSION], [4.7.9])
 m4_define([MUSTACHE_SPEC_VERSION], [1.1.3])
 
 # Initialize autoconf & automake.
@@ -86,6 +87,27 @@ AC_REQUIRE_AUX_FILE([tap-driver.sh])
 AC_PROG_CC
 AC_PROG_CC_STDC
 AC_PROG_CC_C99
+
+# Executable-backed helpers in handlebarsc require bounded POSIX subprocess I/O.
+AC_CHECK_HEADERS([poll.h spawn.h])
+AC_SEARCH_LIBS([clock_gettime], [rt])
+AC_CHECK_FUNCS([clock_gettime poll posix_spawn posix_spawnp posix_spawnattr_setpgroup waitpid])
+AS_IF([
+    test "x$ac_cv_header_poll_h" = "xyes" &&
+    test "x$ac_cv_header_spawn_h" = "xyes" &&
+    test "x$ac_cv_func_clock_gettime" = "xyes" &&
+    test "x$ac_cv_func_poll" = "xyes" &&
+    test "x$ac_cv_func_posix_spawn" = "xyes" &&
+    test "x$ac_cv_func_posix_spawnp" = "xyes" &&
+    test "x$ac_cv_func_posix_spawnattr_setpgroup" = "xyes" &&
+    test "x$ac_cv_func_waitpid" = "xyes"
+], [
+    AC_COMPILE_IFELSE([
+        AC_LANG_PROGRAM([[#include <spawn.h>]], [[short flags = POSIX_SPAWN_SETPGROUP; return flags == 0;]])
+    ], [
+        AC_DEFINE([HANDLEBARSC_HAVE_EXEC_HELPERS], [1], [Build executable-backed handlebarsc helpers])
+    ])
+])
 
 AC_MSG_CHECKING([if compiling with gcc])
 AC_COMPILE_IFELSE(
@@ -420,13 +442,14 @@ AS_IF([test "x$with_mustache_spec" != "xno"], [
 	])
 ])
 
-# pcre
-AC_ARG_ENABLE([pcre], [AS_HELP_STRING([--disable-pcre], [disable support for pcre])], [])
+# pcre2
+AC_ARG_ENABLE([pcre], [AS_HELP_STRING([--disable-pcre], [disable support for PCRE2])], [])
 AS_IF([test "x$enable_pcre" != "xno"], [
-	PKG_CHECK_MODULES(PCRE, [libpcre], [enable_pcre=yes], [AC_MSG_WARN([libpcre not found])])
+	PKG_CHECK_MODULES(PCRE, [libpcre2-8], [enable_pcre=yes], [AC_MSG_WARN([libpcre2-8 not found])])
 ])
 AS_IF([test "x$enable_pcre" == "xyes"], [
-	AC_DEFINE([HANDLEBARS_HAVE_PCRE], [1], [Use PCRE])
+	AC_DEFINE([PCRE2_CODE_UNIT_WIDTH], [8], [Use the 8-bit PCRE2 library])
+	AC_DEFINE([HANDLEBARS_HAVE_PCRE], [1], [Use PCRE2])
 ])
 AM_CONDITIONAL([PCRE], [test "x$enable_pcre" == "xyes"])
 
@@ -442,7 +465,7 @@ AM_CONDITIONAL([PTHREAD], [test "x$enable_pthread" == "xyes"])
 
 # refcounting
 AC_ARG_ENABLE([refcounting],
-	[AS_HELP_STRING([--disable-refcounting], [disable refcounting of handlebars values])], [])
+	[AS_HELP_STRING([--disable-refcounting], [use experimental bounded-context arena ownership])], [])
 
 AS_IF([test "x$enable_refcounting" == "xno"], [
     AC_DEFINE([HANDLEBARS_NO_REFCOUNT], [1], [Disable refcounting of handlebars values])

@@ -19,6 +19,7 @@
 #define HANDLEBARS_VM_H
 
 #include "handlebars.h"
+#include "handlebars_types.h"
 
 HBS_EXTERN_C_START
 
@@ -28,6 +29,13 @@ struct handlebars_context;
 struct handlebars_map;
 struct handlebars_module;
 struct handlebars_options;
+
+/**
+ * @brief Stateful template VM.
+ *
+ * A VM must not be used concurrently. Create a separate VM and context for
+ * each concurrent request or worker.
+ */
 struct handlebars_vm;
 
 #ifndef HANDLEBARS_VM_STACK_SIZE
@@ -36,6 +44,10 @@ struct handlebars_vm;
 
 #ifndef HANDLEBARS_VM_BUFFER_INIT_SIZE
 #define HANDLEBARS_VM_BUFFER_INIT_SIZE 128
+#endif
+
+#ifndef HANDLEBARS_VM_MAX_DEPTH
+#define HANDLEBARS_VM_MAX_DEPTH 256
 #endif
 
 extern const size_t HANDLEBARS_VM_SIZE;
@@ -50,6 +62,21 @@ struct handlebars_vm * handlebars_vm_ctor(
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
 
 /**
+ * @brief Construct a VM without allowing an internal longjmp to escape.
+ *
+ * Clears the context's previous error. On failure, `*result` is NULL and the
+ * returned error and context error state describe the failure.
+ *
+ * @param[in] context The parent handlebars and talloc context
+ * @param[out] result Receives the initialized VM on success
+ * @return #HANDLEBARS_SUCCESS on success, otherwise the error code
+ */
+enum handlebars_error_type handlebars_vm_ctor_try(
+    struct handlebars_context * context,
+    struct handlebars_vm ** result
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
+
+/**
  * @brief Destruct a VM
  * @param[in] vm The VM to destruct
  * @return The string array
@@ -58,12 +85,26 @@ void handlebars_vm_dtor(
     struct handlebars_vm * vm
 ) HBS_ATTR_NONNULL_ALL;
 
+/**
+ * @brief Execute the main program in a module.
+ *
+ * The returned string is owned beneath @p vm. The caller should release it
+ * with #handlebars_string_delref after use, or copy it before destroying the
+ * VM if it must live longer.
+ */
 struct handlebars_string * handlebars_vm_execute(
     struct handlebars_vm * vm,
     struct handlebars_module * module,
     struct handlebars_value * context
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_NOINLINE;
 
+/**
+ * @brief Execute a selected program in a module.
+ *
+ * The returned string is owned beneath @p vm. The caller should release it
+ * with #handlebars_string_delref after use, or copy it before destroying the
+ * VM if it must live longer.
+ */
 struct handlebars_string * handlebars_vm_execute_ex(
     struct handlebars_vm * vm,
     struct handlebars_module * module,
@@ -73,12 +114,72 @@ struct handlebars_string * handlebars_vm_execute_ex(
     struct handlebars_value * block_params
 ) HBS_ATTR_NONNULL(1, 2, 3) HBS_ATTR_NOINLINE;
 
+/**
+ * @brief Execute a module without allowing an internal longjmp to escape.
+ *
+ * Equivalent to #handlebars_vm_execute_try_ex with the main program and no
+ * explicit data or block-parameter frames.
+ *
+ * @param[in] vm The VM
+ * @param[in] module The serialized module
+ * @param[in] context The input value
+ * @param[out] result Receives the rendered VM-owned string on success. The
+ *                    caller should release it with #handlebars_string_delref.
+ * @return #HANDLEBARS_SUCCESS on success, otherwise the error code
+ */
+enum handlebars_error_type handlebars_vm_execute_try(
+    struct handlebars_vm * vm,
+    struct handlebars_module * module,
+    struct handlebars_value * context,
+    struct handlebars_string ** result
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
+
+/**
+ * @brief Execute a module without allowing an internal longjmp to escape.
+ *
+ * Clears the VM context's previous error. On failure, `*result` is NULL and
+ * the VM is restored to its pre-call state so it can be reused.
+ *
+ * @param[in] vm The VM
+ * @param[in] module The serialized module
+ * @param[in] context The input value
+ * @param[in] program The program index to execute
+ * @param[in] data Optional data frame
+ * @param[in] block_params Optional block-parameter frame
+ * @param[out] result Receives the rendered VM-owned string on success. The
+ *                    caller should release it with #handlebars_string_delref.
+ * @return #HANDLEBARS_SUCCESS on success, otherwise the error code
+ */
+enum handlebars_error_type handlebars_vm_execute_try_ex(
+    struct handlebars_vm * vm,
+    struct handlebars_module * module,
+    struct handlebars_value * context,
+    long program,
+    struct handlebars_value * data,
+    struct handlebars_value * block_params,
+    struct handlebars_string ** result
+) HBS_ATTR_NONNULL(1, 2, 3, 7) HBS_ATTR_WARN_UNUSED_RESULT;
+
+/**
+ * @brief Execute a program in the VM's current module.
+ *
+ * The returned string is owned beneath @p vm. The caller should release it
+ * with #handlebars_string_delref after use, or copy it before destroying the
+ * VM if it must live longer.
+ */
 struct handlebars_string * handlebars_vm_execute_program(
     struct handlebars_vm * vm,
     long program,
     struct handlebars_value * context
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
 
+/**
+ * @brief Execute a program in the VM's current module with explicit frames.
+ *
+ * The returned string is owned beneath @p vm. The caller should release it
+ * with #handlebars_string_delref after use, or copy it before destroying the
+ * VM if it must live longer.
+ */
 struct handlebars_string * handlebars_vm_execute_program_ex(
     struct handlebars_vm * vm,
     long program,
@@ -87,6 +188,16 @@ struct handlebars_string * handlebars_vm_execute_program_ex(
     struct handlebars_value * block_params
 ) HBS_ATTR_NONNULL(1, 3) HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
 
+/**
+ * @brief Invoke a registered or built-in helper by name.
+ *
+ * This is a low-level legacy entry point. Helper errors may `longjmp` through
+ * the VM context's installed error boundary. Applications rendering templates
+ * without consumer-visible `longjmp` should call #handlebars_vm_execute_try or
+ * #handlebars_vm_execute_try_ex instead of invoking helpers directly.
+ *
+ * @return The helper result, or NULL when no helper has the supplied name
+ */
 struct handlebars_value * handlebars_vm_call_helper_str(
     const char * name,
     unsigned int len,
@@ -97,11 +208,79 @@ struct handlebars_value * handlebars_vm_call_helper_str(
     struct handlebars_value * rv
 ) HBS_ATTR_NONNULL(1, 4, 5) HBS_ATTR_WARN_UNUSED_RESULT;
 
+/**
+ * @brief Set the VM's execution flags.
+ *
+ * @param[in] vm The VM
+ * @param[in] flags The new flag bitmask
+ */
 void handlebars_vm_set_flags(struct handlebars_vm * vm, unsigned long flags) HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Set the helpers available to the VM.
+ *
+ * The value is copied into the VM. Reference-backed payloads are shared rather
+ * than deep-copied, and remain bounded by their original talloc context. Keep
+ * that context alive while the VM may use the helpers.
+ *
+ * @param[in] vm The VM
+ * @param[in] helpers The helpers value
+ */
 void handlebars_vm_set_helpers(struct handlebars_vm * vm, struct handlebars_value * helpers) HBS_ATTR_NONNULL_ALL;
-void handlebars_vm_set_partials(struct handlebars_vm * vm, struct handlebars_value * helpers) HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Set the partials available to the VM.
+ *
+ * The value is copied into the VM. Reference-backed payloads are shared rather
+ * than deep-copied, and remain bounded by their original talloc context. Keep
+ * that context alive while the VM may use the partials.
+ *
+ * @param[in] vm The VM
+ * @param[in] partials The partials value
+ */
+void handlebars_vm_set_partials(struct handlebars_vm * vm, struct handlebars_value * partials) HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Set the default data available to the VM.
+ *
+ * The value is copied into the VM. Reference-backed payloads are shared rather
+ * than deep-copied, and remain bounded by their original talloc context. Keep
+ * that context alive while the VM may use the data.
+ *
+ * @param[in] vm The VM
+ * @param[in] data The data value
+ */
 void handlebars_vm_set_data(struct handlebars_vm * vm, struct handlebars_value * data) HBS_ATTR_NONNULL_ALL;
-void handlebars_vm_set_cache(struct handlebars_vm * vm, struct handlebars_cache * cache) HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Set or clear the VM's cache.
+ *
+ * The cache is borrowed: the setter does not adopt, reparent, or explicitly
+ * destroy it, and its existing talloc parent remains its lifetime ceiling. A
+ * non-NULL cache must remain alive until it is replaced or cleared and every
+ * VM call that may have used it has returned. Pass NULL to disable caching.
+ *
+ * Runtime cache keys include the processed template and compilation flags.
+ * Their encoding is internal; raw template keys added through the cache API
+ * do not preload the VM's runtime cache.
+ *
+ * @param[in] vm The VM
+ * @param[in] cache The borrowed cache, or NULL to disable caching
+ */
+void handlebars_vm_set_cache(struct handlebars_vm * vm, struct handlebars_cache * cache) HBS_ATTR_NONNULL(1);
+
+/**
+ * @brief Set the VM's logger callback and context.
+ *
+ * The VM borrows both arguments. The setter does not adopt, reparent, or
+ * explicitly destroy @p log_ctx, and its existing talloc parent remains its
+ * lifetime ceiling. The context may be NULL; otherwise it must remain valid
+ * while the VM can call @p log_func.
+ *
+ * @param[in] vm The VM
+ * @param[in] log_func The logger callback
+ * @param[in] log_ctx The borrowed callback context, or NULL
+ */
 void handlebars_vm_set_logger(struct handlebars_vm * vm, handlebars_func log_func, void * log_ctx) HBS_ATTR_NONNULL(1, 2);
 
 handlebars_func handlebars_vm_get_log_func(struct handlebars_vm * vm);

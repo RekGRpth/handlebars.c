@@ -20,11 +20,15 @@
 #endif
 
 #include <assert.h>
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define HANDLEBARS_OPCODE_SERIALIZER_PRIVATE
 #define HANDLEBARS_OPCODES_PRIVATE
+#define HANDLEBARS_PARTIAL_LOADER_PRIVATE
 
 #include "handlebars.h"
 #include "handlebars_memory.h"
@@ -33,12 +37,14 @@
 #include "handlebars_vm_private.h"
 
 #include "handlebars_cache.h"
+#include "handlebars_cache_private.h"
 #include "handlebars_closure.h"
 #include "handlebars_compiler.h"
 #include "handlebars_delimiters.h"
 #include "handlebars_helpers.h"
 #include "handlebars_map.h"
 #include "handlebars_parser.h"
+#include "handlebars_partial_loader.h"
 #include "handlebars_ptr.h"
 #include "handlebars_opcodes.h"
 #include "handlebars_opcode_printer.h"
@@ -62,6 +68,7 @@
 #define ACCEPT_FN(name) accept_ ## name
 #define ACCEPT_NAMED_FUNCTION(name) static inline void name (struct handlebars_vm * vm, struct handlebars_opcode * opcode)
 #define ACCEPT_FUNCTION(name) ACCEPT_NAMED_FUNCTION(ACCEPT_FN(name))
+#define ACCEPT_NOINLINE_FUNCTION(name) static void ACCEPT_FN(name) (struct handlebars_vm * vm, struct handlebars_opcode * opcode)
 
 #undef CONTEXT
 #define CONTEXT HBSCTX(vm)
@@ -71,6 +78,16 @@
 // {{{ Prototypes & Variables
 
 ACCEPT_FUNCTION(push_context);
+
+static struct handlebars_string * handlebars_vm_execute_ex_internal(
+    struct handlebars_vm * vm,
+    struct handlebars_module * module,
+    struct handlebars_value * context,
+    long program,
+    struct handlebars_value * data,
+    struct handlebars_value * block_params,
+    bool initialize_data
+);
 
 const size_t HANDLEBARS_VM_SIZE = sizeof(struct handlebars_vm);
 
@@ -112,14 +129,73 @@ static inline struct handlebars_value * pop(struct handlebars_stack * stack, str
 
 // {{{ Constructors & Destructors
 
+struct handlebars_vm_ctor_state {
+    struct handlebars_vm * vm;
+};
+
+static void handlebars_vm_ctor_init(
+    struct handlebars_context * context,
+    struct handlebars_vm_ctor_state * state
+)
+{
+    struct handlebars_vm * vm = handlebars_talloc_zero(
+        context,
+        struct handlebars_vm
+    );
+
+    HANDLEBARS_MEMCHECK(vm, context);
+    state->vm = vm;
+    handlebars_context_bind(context, HBSCTX(vm));
+    handlebars_value_map(&vm->helpers, handlebars_map_ctor(HBSCTX(vm), 0));
+    handlebars_value_map(&vm->partials, handlebars_map_ctor(HBSCTX(vm), 0));
+}
+
 struct handlebars_vm * handlebars_vm_ctor(struct handlebars_context * ctx)
 {
-    struct handlebars_vm * vm = handlebars_talloc_zero(ctx, struct handlebars_vm);
-    HANDLEBARS_MEMCHECK(vm, ctx);
-    handlebars_context_bind(ctx, HBSCTX(vm));
-    handlebars_value_map(&vm->helpers, handlebars_map_ctor(ctx, 0));
-    handlebars_value_map(&vm->partials, handlebars_map_ctor(ctx, 0));
-    return vm;
+    struct handlebars_vm_ctor_state state = {0};
+
+    handlebars_vm_ctor_init(ctx, &state);
+    return state.vm;
+}
+
+HBS_ATTR_NOINLINE
+static enum handlebars_error_type handlebars_vm_ctor_try_guarded(
+    struct handlebars_context * context,
+    struct handlebars_vm_ctor_state * state
+) {
+    struct handlebars_error * error = context->e;
+    jmp_buf * volatile previous = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(context, &buf) ) {
+        caught = error->num;
+        if( state->vm != NULL ) {
+            handlebars_vm_dtor(state->vm);
+            state->vm = NULL;
+        }
+    } else {
+        handlebars_vm_ctor_init(context, state);
+    }
+
+    error->jmp = previous;
+    return caught;
+}
+
+enum handlebars_error_type handlebars_vm_ctor_try(
+    struct handlebars_context * context,
+    struct handlebars_vm ** result
+) {
+    struct handlebars_vm_ctor_state state = {0};
+    enum handlebars_error_type error;
+
+    *result = NULL;
+    handlebars_error_clear(context);
+    error = handlebars_vm_ctor_try_guarded(context, &state);
+    if( error == HANDLEBARS_SUCCESS ) {
+        *result = state.vm;
+    }
+    return error;
 }
 
 
@@ -128,6 +204,7 @@ void handlebars_vm_dtor(struct handlebars_vm * vm)
     handlebars_value_dtor(&vm->helpers);
     handlebars_value_dtor(&vm->partials);
     handlebars_value_dtor(&vm->data);
+    handlebars_value_dtor(&vm->render_data);
     if (vm->delim_open) {
         handlebars_string_delref(vm->delim_open);
     }
@@ -135,6 +212,154 @@ void handlebars_vm_dtor(struct handlebars_vm * vm)
         handlebars_string_delref(vm->delim_close);
     }
     handlebars_talloc_free(vm);
+}
+
+HBS_LOCAL void handlebars_vm_call_checkpoint_begin(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_call_checkpoint * checkpoint
+)
+{
+    checkpoint->open = false;
+    checkpoint->stacks_active = vm->stack != NULL;
+    checkpoint->data_proxy_snapshot = NULL;
+    handlebars_value_init(&checkpoint->data);
+    handlebars_value_value(&checkpoint->data, &vm->data);
+    checkpoint->data_proxy_count = vm->data_proxy_count;
+    checkpoint->buffer = vm->buffer;
+    checkpoint->depth = vm->depth;
+
+    if( !checkpoint->stacks_active ) {
+        assert(vm->hashStack == NULL);
+        assert(vm->contextStack == NULL);
+        assert(vm->blockParamStack == NULL);
+        assert(vm->partialBlockStack == NULL);
+        assert(vm->partialScopeStack == NULL);
+    } else {
+        assert(vm->hashStack != NULL);
+        assert(vm->contextStack != NULL);
+        assert(vm->blockParamStack != NULL);
+        assert(vm->partialBlockStack != NULL);
+        assert(vm->partialScopeStack != NULL);
+        checkpoint->stack = handlebars_stack_save(vm->stack);
+        checkpoint->hash_stack = handlebars_stack_save(vm->hashStack);
+        checkpoint->context_stack = handlebars_stack_save(vm->contextStack);
+        checkpoint->block_param_stack = handlebars_stack_save(vm->blockParamStack);
+        checkpoint->partial_block_stack = handlebars_stack_save(vm->partialBlockStack);
+        checkpoint->partial_scope_stack = handlebars_stack_save(vm->partialScopeStack);
+    }
+    checkpoint->open = true;
+    if( checkpoint->data_proxy_count > 0 ) {
+        assert(vm->data_proxies != NULL);
+        checkpoint->data_proxy_snapshot = handlebars_talloc_array(
+            vm,
+            struct handlebars_vm_data_proxy,
+            checkpoint->data_proxy_count
+        );
+        HANDLEBARS_MEMCHECK(checkpoint->data_proxy_snapshot, HBSCTX(vm));
+        memcpy(
+            checkpoint->data_proxy_snapshot,
+            vm->data_proxies,
+            sizeof(*checkpoint->data_proxy_snapshot)
+                * checkpoint->data_proxy_count
+        );
+    }
+}
+
+HBS_LOCAL void handlebars_vm_call_checkpoint_commit(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_call_checkpoint * checkpoint
+)
+{
+    if( !checkpoint->open ) {
+        return;
+    }
+
+    if( checkpoint->stacks_active ) {
+        handlebars_stack_protect(vm->stack, checkpoint->stack.protect);
+        handlebars_stack_protect(vm->hashStack, checkpoint->hash_stack.protect);
+        handlebars_stack_protect(vm->contextStack, checkpoint->context_stack.protect);
+        handlebars_stack_protect(vm->blockParamStack, checkpoint->block_param_stack.protect);
+        handlebars_stack_protect(vm->partialBlockStack, checkpoint->partial_block_stack.protect);
+        handlebars_stack_protect(vm->partialScopeStack, checkpoint->partial_scope_stack.protect);
+    }
+    if( checkpoint->data_proxy_snapshot != NULL ) {
+        handlebars_talloc_free(checkpoint->data_proxy_snapshot);
+        checkpoint->data_proxy_snapshot = NULL;
+    }
+    handlebars_value_dtor(&checkpoint->data);
+    checkpoint->open = false;
+}
+
+HBS_LOCAL void handlebars_vm_call_checkpoint_rollback(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_call_checkpoint * checkpoint
+)
+{
+    if( !checkpoint->open ) {
+        return;
+    }
+
+    if( checkpoint->stacks_active ) {
+        handlebars_stack_restore(vm->stack, checkpoint->stack);
+        handlebars_stack_restore(vm->hashStack, checkpoint->hash_stack);
+        handlebars_stack_restore(vm->contextStack, checkpoint->context_stack);
+        handlebars_stack_restore(vm->blockParamStack, checkpoint->block_param_stack);
+        handlebars_stack_restore(vm->partialBlockStack, checkpoint->partial_block_stack);
+        handlebars_stack_restore(vm->partialScopeStack, checkpoint->partial_scope_stack);
+    }
+    if( vm->buffer != checkpoint->buffer ) {
+        if( vm->buffer != NULL ) {
+            handlebars_string_delref(vm->buffer);
+        }
+        vm->buffer = checkpoint->buffer;
+    }
+    handlebars_value_value(&vm->data, &checkpoint->data);
+    if( checkpoint->data_proxy_snapshot != NULL ) {
+        assert(vm->data_proxies != NULL);
+        memcpy(
+            vm->data_proxies,
+            checkpoint->data_proxy_snapshot,
+            sizeof(*checkpoint->data_proxy_snapshot)
+                * checkpoint->data_proxy_count
+        );
+        handlebars_talloc_free(checkpoint->data_proxy_snapshot);
+        checkpoint->data_proxy_snapshot = NULL;
+    }
+    vm->data_proxy_count = checkpoint->data_proxy_count;
+    handlebars_value_dtor(&checkpoint->data);
+    vm->depth = checkpoint->depth;
+    checkpoint->open = false;
+}
+
+HBS_LOCAL void handlebars_vm_call_checkpoint_finish(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_call_checkpoint * checkpoint,
+    enum handlebars_error_type result
+)
+{
+    if( result == HANDLEBARS_SUCCESS ) {
+        handlebars_vm_call_checkpoint_commit(vm, checkpoint);
+    } else {
+        handlebars_vm_call_checkpoint_rollback(vm, checkpoint);
+    }
+}
+
+HBS_LOCAL HBS_ATTR_NORETURN void handlebars_vm_rethrow_caught(
+    struct handlebars_vm * vm,
+    jmp_buf * previous,
+    enum handlebars_error_type caught
+)
+{
+    assert(caught != HANDLEBARS_SUCCESS);
+    if( likely(previous != NULL) ) {
+        handlebars_longjmp(HBSCTX(vm), previous, caught);
+    }
+    fprintf(
+        stderr,
+        "Throw with invalid jmp_buf: %s\n",
+        handlebars_error_msg(HBSCTX(vm))
+    );
+    abort();
 }
 
 // }}} Constructors & Destructors
@@ -159,6 +384,63 @@ void handlebars_vm_set_partials(struct handlebars_vm * vm, struct handlebars_val
 void handlebars_vm_set_data(struct handlebars_vm * vm, struct handlebars_value * data)
 {
     handlebars_value_value(&vm->data, data);
+    vm->data_proxy_count = 0;
+}
+
+static const struct handlebars_vm_data_proxy * handlebars_vm_find_data_proxy(
+    struct handlebars_vm * vm,
+    struct handlebars_value * value
+)
+{
+    if( value->type != HANDLEBARS_VALUE_TYPE_MAP ) {
+        return NULL;
+    }
+    for( size_t i = vm->data_proxy_count; i > 0; i-- ) {
+        const struct handlebars_vm_data_proxy * proxy = &vm->data_proxies[i - 1];
+        if( proxy->frame == value->v.map ) {
+            return proxy;
+        }
+    }
+    return NULL;
+}
+
+HBS_LOCAL void handlebars_vm_register_data_proxy(
+    struct handlebars_vm * vm,
+    struct handlebars_map * frame,
+    struct handlebars_value * parent
+)
+{
+    struct handlebars_user * source;
+    unsigned char flags;
+
+    if( vm->data_proxies == NULL ) {
+        return;
+    }
+    if( parent->type == HANDLEBARS_VALUE_TYPE_USER
+            && handlebars_value_get_type(parent) == HANDLEBARS_VALUE_TYPE_MAP ) {
+        source = parent->v.user;
+        flags = parent->flags;
+    } else {
+        const struct handlebars_vm_data_proxy * proxy =
+            handlebars_vm_find_data_proxy(vm, parent);
+        if( proxy == NULL ) {
+            return;
+        }
+        source = proxy->source;
+        flags = proxy->flags;
+    }
+
+    if( unlikely(vm->data_proxy_count >= HANDLEBARS_VM_MAX_DEPTH) ) {
+        handlebars_throw(
+            HBSCTX(vm),
+            HANDLEBARS_STACK_OVERFLOW,
+            "VM data-frame stack overflow"
+        );
+    }
+    vm->data_proxies[vm->data_proxy_count].frame = frame;
+    vm->data_proxies[vm->data_proxy_count].source = source;
+    vm->data_proxies[vm->data_proxy_count].flags = flags;
+    vm->data_proxy_count++;
 }
 
 void handlebars_vm_set_cache(struct handlebars_vm * vm, struct handlebars_cache * cache)
@@ -204,6 +486,55 @@ static inline struct handlebars_value * lookup_helper(
     return rv;
 }
 
+HBS_ATTR_NONNULL_ALL
+static inline struct handlebars_value * lookup_partial(
+    struct handlebars_vm * vm,
+    struct handlebars_string * name,
+    struct handlebars_value * rv
+) {
+    if( vm->partialScopeStack != NULL ) {
+        size_t count = LEN(vm->partialScopeStack);
+        for( size_t i = 0; i < count; i++ ) {
+            struct handlebars_value * scope = GET(vm->partialScopeStack, i);
+            struct handlebars_value * partial;
+
+            if( unlikely(scope == NULL
+                    || handlebars_value_get_type(scope) != HANDLEBARS_VALUE_TYPE_MAP) ) {
+                handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Invalid inline partial scope");
+            }
+            partial = handlebars_value_map_find(scope, name, rv);
+            if( partial != NULL ) {
+                return partial;
+            }
+        }
+    }
+    if( handlebars_value_is_partial_loader(&vm->partials) ) {
+        struct handlebars_context * loader_context =
+            handlebars_value_get_user(&vm->partials)->ctx;
+        enum handlebars_error_type error =
+            handlebars_value_partial_loader_find_try(
+                &vm->partials,
+                name,
+                rv
+            );
+
+        if( unlikely(error != HANDLEBARS_SUCCESS) ) {
+            struct handlebars_locinfo loc = handlebars_error_loc(loader_context);
+            const char * message = handlebars_error_msg(loader_context);
+
+            handlebars_throw_ex(
+                CONTEXT,
+                error,
+                &loc,
+                "%s",
+                message != NULL ? message : "Partial loader error"
+            );
+        }
+        return rv;
+    }
+    return handlebars_value_map_find(&vm->partials, name, rv);
+}
+
 HBS_ATTR_NONNULL(1, 4, 5)
 struct handlebars_value * handlebars_vm_call_helper_str(const char * name, unsigned int len, HANDLEBARS_HELPER_ARGS)
 {
@@ -221,7 +552,44 @@ struct handlebars_value * handlebars_vm_call_helper_str(const char * name, unsig
     return rv;
 }
 
-static inline void setup_options(struct handlebars_vm * vm, int argc, struct handlebars_value * argv, struct handlebars_options * options, struct handlebars_value * mem)
+HBS_LOCAL size_t handlebars_vm_program_block_params(
+    struct handlebars_vm * vm,
+    long program
+)
+{
+    struct handlebars_module_table_entry * entry;
+
+    if( program < 0 ) {
+        return 0;
+    }
+    if( unlikely((size_t) program >= vm->module->program_count) ) {
+        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Invalid program: %ld", program);
+    }
+    entry = &vm->module->programs[program];
+    if( unlikely(entry->guid != (size_t) program || entry->block_params > 2) ) {
+        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Invalid program metadata: %ld", program);
+    }
+    return entry->block_params;
+}
+
+static inline bool helper_context_is_truthy(struct handlebars_value * value)
+{
+    switch( value->type ) {
+        case HANDLEBARS_VALUE_TYPE_NULL:
+        case HANDLEBARS_VALUE_TYPE_FALSE:
+            return false;
+        case HANDLEBARS_VALUE_TYPE_INTEGER:
+            return value->v.lval != 0;
+        case HANDLEBARS_VALUE_TYPE_FLOAT:
+            return value->v.dval != 0.0 && !isnan(value->v.dval);
+        case HANDLEBARS_VALUE_TYPE_STRING:
+            return hbs_str_len(value->v.string) != 0;
+        default:
+            return true;
+    }
+}
+
+static void setup_options(struct handlebars_vm * vm, int argc, struct handlebars_value * argv, struct handlebars_options * options, struct handlebars_value * mem)
 {
     struct handlebars_value * inverse;
     struct handlebars_value * program;
@@ -245,6 +613,10 @@ static inline void setup_options(struct handlebars_vm * vm, int argc, struct han
     }
     if (program) {
         options->program = handlebars_value_get_intval(program);
+        options->program_block_params = handlebars_vm_program_block_params(
+            vm,
+            options->program
+        );
         handlebars_value_dtor(program);
     } else {
         options->program = -1;
@@ -274,6 +646,154 @@ static inline void append_to_buffer(struct handlebars_vm * vm, struct handlebars
 }
 
 HBS_ATTR_NONNULL_ALL
+static inline bool parse_array_index(
+    struct handlebars_string * key,
+    size_t * index
+)
+{
+    const unsigned char * str = (const unsigned char *) hbs_str_val(key);
+    size_t length = hbs_str_len(key);
+    size_t result = 0;
+
+    if( length == 0 || (length > 1 && str[0] == '0') ) {
+        return false;
+    }
+    for( size_t i = 0; i < length; i++ ) {
+        size_t digit;
+
+        if( str[i] < '0' || str[i] > '9' ) {
+            return false;
+        }
+        digit = (size_t) (str[i] - '0');
+        if( result > (SIZE_MAX - digit) / 10 ) {
+            return false;
+        }
+        result = result * 10 + digit;
+    }
+    *index = result;
+    return true;
+}
+
+HBS_LOCAL struct handlebars_value * handlebars_vm_lookup_property(
+    struct handlebars_vm * vm,
+    struct handlebars_value * value,
+    struct handlebars_string * key,
+    struct handlebars_value * rv
+)
+{
+    enum handlebars_value_type type = handlebars_value_get_type(value);
+    bool can_count = value->type != HANDLEBARS_VALUE_TYPE_USER
+        || handlebars_value_get_handlers(value)->count != NULL;
+
+    if( type == HANDLEBARS_VALUE_TYPE_MAP ) {
+        return handlebars_value_map_find(value, key, rv);
+    }
+    if( hbs_str_eq_strl(key, HBS_STRL("length")) ) {
+        long length = -1;
+
+        if( type == HANDLEBARS_VALUE_TYPE_ARRAY && can_count ) {
+            length = handlebars_value_count(value);
+        } else if( type == HANDLEBARS_VALUE_TYPE_STRING ) {
+            if( value->type == HANDLEBARS_VALUE_TYPE_STRING ) {
+                size_t string_length = handlebars_value_get_strlen(value);
+
+                if( unlikely(string_length > LONG_MAX) ) {
+                    handlebars_throw(
+                        CONTEXT,
+                        HANDLEBARS_ERROR,
+                        "String length exceeds the supported integer range"
+                    );
+                }
+                length = (long) string_length;
+            } else if( can_count ) {
+                length = handlebars_value_count(value);
+            }
+        }
+        if( length >= 0 ) {
+            handlebars_value_integer(rv, length);
+            return rv;
+        }
+    }
+    if( type == HANDLEBARS_VALUE_TYPE_ARRAY ) {
+        size_t index;
+
+        if( parse_array_index(key, &index) ) {
+            return handlebars_value_array_find(value, index, rv);
+        }
+    }
+    return NULL;
+}
+
+static struct handlebars_value * handlebars_vm_lookup_data_property(
+    struct handlebars_vm * vm,
+    struct handlebars_value * data,
+    struct handlebars_string * key,
+    struct handlebars_value * rv
+)
+{
+    struct handlebars_value * result = handlebars_vm_lookup_property(
+        vm,
+        data,
+        key,
+        rv
+    );
+    const struct handlebars_vm_data_proxy * proxy;
+
+    if( result != NULL ) {
+        return result;
+    }
+    proxy = handlebars_vm_find_data_proxy(vm, data);
+    if( proxy != NULL ) {
+        struct handlebars_value source = {
+            .type = HANDLEBARS_VALUE_TYPE_USER,
+            .flags = proxy->flags,
+            .v.user = proxy->source
+        };
+        result = handlebars_vm_lookup_property(vm, &source, key, rv);
+        if( result != NULL && result != rv ) {
+            handlebars_value_value(rv, result);
+            result = rv;
+        }
+    }
+    return result;
+}
+
+static struct handlebars_value * handlebars_vm_lookup_data_map_str_find(
+    struct handlebars_vm * vm,
+    struct handlebars_value * data,
+    const char * key,
+    size_t length,
+    struct handlebars_value * rv
+)
+{
+    struct handlebars_value * result = handlebars_value_map_str_find(
+        data,
+        key,
+        length,
+        rv
+    );
+    const struct handlebars_vm_data_proxy * proxy;
+
+    if( result != NULL ) {
+        return result;
+    }
+    proxy = handlebars_vm_find_data_proxy(vm, data);
+    if( proxy != NULL ) {
+        struct handlebars_value source = {
+            .type = HANDLEBARS_VALUE_TYPE_USER,
+            .flags = proxy->flags,
+            .v.user = proxy->source
+        };
+        result = handlebars_value_map_str_find(&source, key, length, rv);
+        if( result != NULL && result != rv ) {
+            handlebars_value_value(rv, result);
+            result = rv;
+        }
+    }
+    return result;
+}
+
+HBS_ATTR_NONNULL_ALL
 static inline void depthed_lookup(struct handlebars_vm * vm, struct handlebars_string * key)
 {
     size_t i;
@@ -286,11 +806,9 @@ static inline void depthed_lookup(struct handlebars_vm * vm, struct handlebars_s
     for( i = 0, l = LEN(vm->contextStack); i < l; i++ ) {
         value = GET(vm->contextStack, i);
         assert(value != NULL);
-        if( handlebars_value_get_type(value) == HANDLEBARS_VALUE_TYPE_MAP ) {
-            tmp = handlebars_value_map_find(value, key, rv);
-            if( tmp != NULL ) {
-                break;
-            }
+        tmp = handlebars_vm_lookup_property(vm, value, key, rv);
+        if( tmp != NULL ) {
+            break;
         }
         value = empty_value;
     }
@@ -320,32 +838,277 @@ static inline struct handlebars_value * merge_hash(struct handlebars_context * c
     return input;
 }
 
+struct handlebars_vm_error_snapshot {
+    enum handlebars_error_type num;
+    struct handlebars_locinfo loc;
+    const char * msg;
+    bool detached;
+};
+
+static bool handlebars_vm_error_snapshot_begin(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_error_snapshot * snapshot
+)
+{
+    struct handlebars_error * vm_error = HBSCTX(vm)->e;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    if( vm_error->num == HANDLEBARS_SUCCESS ) {
+        return false;
+    }
+
+    snapshot->num = vm_error->num;
+    snapshot->loc = vm_error->loc;
+    snapshot->msg = vm_error->msg;
+    vm_error->num = HANDLEBARS_SUCCESS;
+    memset(&vm_error->loc, 0, sizeof(vm_error->loc));
+    vm_error->msg = NULL;
+    snapshot->detached = true;
+    return true;
+}
+
+static void handlebars_vm_error_snapshot_discard(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_error_snapshot * snapshot
+)
+{
+    struct handlebars_error * vm_error = HBSCTX(vm)->e;
+    enum handlebars_error_type cache_error = vm_error->num;
+    struct handlebars_locinfo cache_loc = vm_error->loc;
+    const char * cache_message = vm_error->msg;
+
+    vm_error->msg = snapshot->msg;
+    handlebars_error_clear(HBSCTX(vm));
+    vm_error->num = cache_error;
+    vm_error->loc = cache_loc;
+    vm_error->msg = cache_message;
+    snapshot->detached = false;
+}
+
+static void handlebars_vm_error_snapshot_restore(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_error_snapshot * snapshot
+)
+{
+    struct handlebars_error * vm_error = HBSCTX(vm)->e;
+
+    handlebars_error_clear(HBSCTX(vm));
+    vm_error->num = snapshot->num;
+    vm_error->loc = snapshot->loc;
+    vm_error->msg = snapshot->msg;
+    snapshot->detached = false;
+}
+
+static void handlebars_vm_execution_error_snapshot_finish(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_error_snapshot * snapshot
+)
+{
+    if( !snapshot->detached ) {
+        return;
+    }
+    if( HBSCTX(vm)->e->num == HANDLEBARS_SUCCESS ) {
+        handlebars_vm_error_snapshot_restore(vm, snapshot);
+    } else {
+        handlebars_vm_error_snapshot_discard(vm, snapshot);
+    }
+}
+
+static enum handlebars_error_type handlebars_vm_cache_error_snapshot_finish(
+    struct handlebars_vm * vm,
+    struct handlebars_vm_error_snapshot * snapshot,
+    enum handlebars_error_type cache_error
+)
+{
+    handlebars_vm_error_snapshot_restore(vm, snapshot);
+    return cache_error == HANDLEBARS_SUCCESS
+        ? HANDLEBARS_SUCCESS
+        : snapshot->num;
+}
+
+static enum handlebars_error_type handlebars_vm_cache_find_try(
+    struct handlebars_vm * vm,
+    struct handlebars_cache * cache,
+    struct handlebars_string * tmpl,
+    struct handlebars_module ** result
+)
+{
+    struct handlebars_vm_error_snapshot snapshot;
+    enum handlebars_error_type cache_error;
+
+    if( HBSCTX(cache)->e != HBSCTX(vm)->e
+            || !handlebars_vm_error_snapshot_begin(vm, &snapshot) ) {
+        if( HBSCTX(vm)->e->num != HANDLEBARS_SUCCESS ) {
+            cache_error = handlebars_cache_find_try(cache, tmpl, result);
+            return cache_error == HANDLEBARS_SUCCESS
+                ? HANDLEBARS_SUCCESS
+                : HBSCTX(vm)->e->num;
+        }
+        return handlebars_cache_find_try_with_error_context(
+            cache,
+            tmpl,
+            result,
+            HBSCTX(vm)
+        );
+    }
+
+    cache_error = handlebars_cache_find_try(cache, tmpl, result);
+    return handlebars_vm_cache_error_snapshot_finish(
+        vm,
+        &snapshot,
+        cache_error
+    );
+}
+
+static enum handlebars_error_type handlebars_vm_cache_add_try(
+    struct handlebars_vm * vm,
+    struct handlebars_cache * cache,
+    struct handlebars_string * tmpl,
+    struct handlebars_module * module
+)
+{
+    struct handlebars_vm_error_snapshot snapshot;
+    enum handlebars_error_type cache_error;
+
+    if( HBSCTX(cache)->e != HBSCTX(vm)->e
+            || !handlebars_vm_error_snapshot_begin(vm, &snapshot) ) {
+        if( HBSCTX(vm)->e->num != HANDLEBARS_SUCCESS ) {
+            cache_error = handlebars_cache_add_try(cache, tmpl, module);
+            return cache_error == HANDLEBARS_SUCCESS
+                ? HANDLEBARS_SUCCESS
+                : HBSCTX(vm)->e->num;
+        }
+        return handlebars_cache_add_try_with_error_context(
+            cache,
+            tmpl,
+            module,
+            HBSCTX(vm)
+        );
+    }
+
+    cache_error = handlebars_cache_add_try(cache, tmpl, module);
+    return handlebars_vm_cache_error_snapshot_finish(
+        vm,
+        &snapshot,
+        cache_error
+    );
+}
+
+static enum handlebars_error_type handlebars_vm_cache_add_or_find_try(
+    struct handlebars_vm * vm,
+    struct handlebars_cache * cache,
+    struct handlebars_string * tmpl,
+    struct handlebars_module * module,
+    struct handlebars_module ** found
+)
+{
+    struct handlebars_vm_error_snapshot snapshot;
+    enum handlebars_error_type add_error;
+    enum handlebars_error_type find_error;
+
+    *found = NULL;
+    handlebars_vm_error_snapshot_begin(vm, &snapshot);
+    add_error = handlebars_vm_cache_add_try(vm, cache, tmpl, module);
+    if( add_error == HANDLEBARS_SUCCESS ) {
+        handlebars_vm_execution_error_snapshot_finish(vm, &snapshot);
+        return HANDLEBARS_SUCCESS;
+    }
+
+    find_error = handlebars_vm_cache_find_try(vm, cache, tmpl, found);
+    if( find_error == HANDLEBARS_SUCCESS && *found != NULL ) {
+        handlebars_error_clear(HBSCTX(vm));
+        handlebars_vm_execution_error_snapshot_finish(vm, &snapshot);
+        return HANDLEBARS_SUCCESS;
+    }
+
+    if( snapshot.detached ) {
+        handlebars_vm_error_snapshot_discard(vm, &snapshot);
+    }
+    return add_error;
+}
+
+static enum handlebars_error_type handlebars_vm_cache_release_try(
+    struct handlebars_vm * vm,
+    struct handlebars_cache * cache,
+    struct handlebars_string * tmpl,
+    struct handlebars_module * module
+)
+{
+    struct handlebars_vm_error_snapshot snapshot;
+    enum handlebars_error_type release_error;
+
+    if( HBSCTX(vm)->e->num == HANDLEBARS_SUCCESS ) {
+        return handlebars_cache_release_try_with_error_context(
+            cache,
+            tmpl,
+            module,
+            HBSCTX(vm)
+        );
+    }
+    if( HBSCTX(cache)->e != HBSCTX(vm)->e ) {
+        release_error = handlebars_cache_release_try(
+            cache,
+            tmpl,
+            module
+        );
+        return release_error == HANDLEBARS_SUCCESS
+            ? HANDLEBARS_SUCCESS
+            : HBSCTX(vm)->e->num;
+    }
+    if( !handlebars_vm_error_snapshot_begin(vm, &snapshot) ) {
+        return handlebars_cache_release_try_with_error_context(
+            cache,
+            tmpl,
+            module,
+            HBSCTX(vm)
+        );
+    }
+
+    release_error = handlebars_cache_release_try(cache, tmpl, module);
+    return handlebars_vm_cache_error_snapshot_finish(
+        vm,
+        &snapshot,
+        release_error
+    );
+}
+
 HBS_ATTR_NONNULL(1, 2)
 static struct handlebars_string * execute_template(
     struct handlebars_vm * vm,
     struct handlebars_string * volatile tmpl,
     struct handlebars_value * input,
+    struct handlebars_value * data,
     struct handlebars_string * indent,
     int escape,
     bool use_delimiters
 ) {
-    struct handlebars_context * context = handlebars_context_ctor_ex(vm);
+    struct handlebars_cache * cache = vm->cache;
+    struct handlebars_context * context = handlebars_talloc_zero(
+        vm,
+        struct handlebars_context
+    );
     struct handlebars_string * volatile retval = NULL;
+    struct handlebars_string * volatile cache_key = NULL;
     struct handlebars_module * volatile module = NULL;
     bool volatile from_cache = false;
+    bool volatile caught_error = false;
     long prev_depth = vm->depth;
     jmp_buf * prev_jmp = HBSCTX(vm)->e->jmp;
     jmp_buf buf;
 
+    HANDLEBARS_MEMCHECK(context, HBSCTX(vm));
+    // Keep temporary allocations grouped under context, but route runtime
+    // parse, compile, and serialization errors through the VM boundary.
+    handlebars_context_bind(HBSCTX(vm), context);
     handlebars_string_addref(tmpl);
 
     // Get template
     if (!hbs_str_len(tmpl)) {
         goto done;
     }
-
     // Save jmp buf
     if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught_error = true;
         goto done;
     }
 
@@ -357,12 +1120,39 @@ static struct handlebars_string * execute_template(
             use_delimiters ? vm->delim_close : NULL
         );
         if (indent) {
-            tmpl = handlebars_string_indent(CONTEXT, tmpl, indent);
+            tmpl = handlebars_string_indent(HBSCTX(context), tmpl, indent);
         }
     }
 
     // Check for cached template, if available
-    module = vm->cache ? handlebars_cache_find(vm->cache, tmpl) : NULL;
+    if( cache ) {
+        // Preserve the processed source and compilation settings for the
+        // entire lookup/add/release lifecycle. The NUL separates the fields.
+        cache_key = handlebars_string_copy_ctor(context, tmpl);
+        cache_key = handlebars_string_asprintf_append(
+            context,
+            cache_key,
+            "%c%lx",
+            0,
+            vm->flags & handlebars_compiler_flag_all
+        );
+        struct handlebars_module * found;
+        enum handlebars_error_type cache_error = handlebars_vm_cache_find_try(
+            vm,
+            cache,
+            (struct handlebars_string *) cache_key,
+            &found
+        );
+
+        if( unlikely(cache_error != HANDLEBARS_SUCCESS) ) {
+            handlebars_vm_rethrow_caught(
+                vm,
+                HBSCTX(vm)->e->jmp,
+                cache_error
+            );
+        }
+        module = found;
+    }
     from_cache = module != NULL;
     if( !from_cache ) {
         // Parse
@@ -378,8 +1168,27 @@ static struct handlebars_string * execute_template(
         module = handlebars_program_serialize(context, program);
 
         // Save cache entry
-        if( vm->cache ) {
-            handlebars_cache_add(vm->cache, tmpl, module);
+        if( cache ) {
+            struct handlebars_module * found;
+            enum handlebars_error_type cache_error = handlebars_vm_cache_add_or_find_try(
+                vm,
+                cache,
+                (struct handlebars_string *) cache_key,
+                (struct handlebars_module *) module,
+                &found
+            );
+
+            if( unlikely(cache_error != HANDLEBARS_SUCCESS) ) {
+                handlebars_vm_rethrow_caught(
+                    vm,
+                    HBSCTX(vm)->e->jmp,
+                    cache_error
+                );
+            }
+            if( found != NULL ) {
+                module = found;
+                from_cache = true;
+            }
         }
 
         // Cleanup parser
@@ -388,7 +1197,15 @@ static struct handlebars_string * execute_template(
 
     vm->depth++;
 
-    retval = handlebars_vm_execute(vm, module, input);
+    retval = handlebars_vm_execute_ex_internal(
+        vm,
+        module,
+        input,
+        0,
+        data,
+        NULL,
+        false
+    );
     assert(retval != NULL);
 
     if (indent && !(vm->flags & handlebars_compiler_flag_compat)) {
@@ -396,13 +1213,34 @@ static struct handlebars_string * execute_template(
     }
 
 done:
-    HBSCTX(vm)->e->jmp = prev_jmp;
-    vm->depth = prev_depth;
-    if( from_cache ) {
-        handlebars_cache_release(vm->cache, tmpl, module);
+    {
+        enum handlebars_error_type release_error = HANDLEBARS_SUCCESS;
+        bool has_primary_error = caught_error
+            || HBSCTX(vm)->e->num != HANDLEBARS_SUCCESS;
+
+        HBSCTX(vm)->e->jmp = prev_jmp;
+        vm->depth = prev_depth;
+        if( from_cache ) {
+            release_error = handlebars_vm_cache_release_try(
+                vm,
+                cache,
+                (struct handlebars_string *) cache_key,
+                (struct handlebars_module *) module
+            );
+        }
+        handlebars_string_delref(tmpl);
+        handlebars_context_dtor(context);
+        if( !has_primary_error && release_error != HANDLEBARS_SUCCESS ) {
+            if( retval != NULL ) {
+                handlebars_string_delref((struct handlebars_string *) retval);
+            }
+            handlebars_vm_rethrow_caught(
+                vm,
+                prev_jmp,
+                release_error
+            );
+        }
     }
-    handlebars_string_delref(tmpl);
-    handlebars_context_dtor(context);
     if (retval) {
         return retval;
     } else {
@@ -413,15 +1251,57 @@ done:
 HANDLEBARS_CLOSURE_ATTRS
 static struct handlebars_value * invoke_partial_block_closure(HANDLEBARS_CLOSURE_ARGS)
 {
-    assert(localc >= 3);
+    struct handlebars_partial_block_closure_state {
+        struct handlebars_value data;
+        size_t data_proxy_count;
+    };
+
+    assert(localc >= 5);
     assert(HANDLEBARS_LOCAL_AT(0)->type == HANDLEBARS_VALUE_TYPE_PTR);
     assert(HANDLEBARS_LOCAL_AT(1)->type == HANDLEBARS_VALUE_TYPE_INTEGER);
     assert(HANDLEBARS_LOCAL_AT(2)->type == HANDLEBARS_VALUE_TYPE_INTEGER);
+    assert(HANDLEBARS_LOCAL_AT(3)->type == HANDLEBARS_VALUE_TYPE_ARRAY);
 
     struct handlebars_module * module = handlebars_value_get_ptr(HANDLEBARS_LOCAL_AT(0), struct handlebars_module);
     long program = handlebars_value_get_intval(HANDLEBARS_LOCAL_AT(1));
     long partial_block_depth = handlebars_value_get_intval(HANDLEBARS_LOCAL_AT(2));
-    bool pushed_partial_block = false;
+    struct handlebars_stack * captured_block_params = handlebars_value_get_stack(HANDLEBARS_LOCAL_AT(3));
+    struct handlebars_stack * previous_block_params = vm->blockParamStack;
+    struct handlebars_stack_save_buf captured_block_params_save = handlebars_stack_save(captured_block_params);
+    struct handlebars_stack_save_buf stack_save = handlebars_stack_save(vm->stack);
+    struct handlebars_stack_save_buf hash_stack_save = handlebars_stack_save(vm->hashStack);
+    struct handlebars_stack_save_buf context_stack_save = handlebars_stack_save(vm->contextStack);
+    struct handlebars_stack_save_buf partial_block_stack_save = handlebars_stack_save(vm->partialBlockStack);
+    struct handlebars_stack_save_buf partial_scope_stack_save = handlebars_stack_save(vm->partialScopeStack);
+    struct handlebars_string * previous_buffer = vm->buffer;
+    long previous_depth = vm->depth;
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_stack * current_block_params;
+    struct handlebars_value * input;
+    struct handlebars_string * buffer;
+    size_t data_capacity;
+    struct handlebars_partial_block_closure_state * state =
+        handlebars_talloc_zero(
+            vm,
+            struct handlebars_partial_block_closure_state
+        );
+    jmp_buf buf;
+
+    HANDLEBARS_MEMCHECK(state, CONTEXT);
+    handlebars_value_init(&state->data);
+    state->data_proxy_count = vm->data_proxy_count;
+
+    /* Keep the closure's snapshot alive when PUSH transfers or separates the
+     * VM's working reference. */
+    handlebars_stack_addref(captured_block_params);
+    vm->blockParamStack = captured_block_params;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
 
     // Push partial block
     if (partial_block_depth > 0) {
@@ -429,33 +1309,581 @@ static struct handlebars_value * invoke_partial_block_closure(HANDLEBARS_CLOSURE
         if( unlikely(partial_block == NULL) ) {
             handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Invalid partial block depth: %ld", partial_block_depth);
         }
-        pushed_partial_block = true;
         PUSH(vm->partialBlockStack, partial_block);
     }
 
-    struct handlebars_value * input = argc > 0 ? &argv[0] : TOP(vm->contextStack);
-    struct handlebars_string * buffer;
+    input = argc > 0 ? &argv[0] : TOP(vm->contextStack);
+    data_capacity = 2;
+    if( options->data->type == HANDLEBARS_VALUE_TYPE_MAP ) {
+        data_capacity += handlebars_value_count(options->data);
+    }
+    handlebars_value_map(
+        &state->data,
+        handlebars_map_ctor(CONTEXT, data_capacity)
+    );
+    if( options->data->type == HANDLEBARS_VALUE_TYPE_MAP ) {
+        HANDLEBARS_VALUE_FOREACH_KV(options->data, key, child) {
+            state->data.v.map = handlebars_map_update(
+                state->data.v.map,
+                key,
+                child
+            );
+        } HANDLEBARS_VALUE_FOREACH_END();
+    }
+    state->data.v.map = handlebars_map_str_update(
+        state->data.v.map,
+        HBS_STRL("_parent"),
+        options->data
+    );
+    state->data.v.map = handlebars_map_str_update(
+        state->data.v.map,
+        HBS_STRL("partial-block"),
+        HANDLEBARS_LOCAL_AT(4)
+    );
+    handlebars_vm_register_data_proxy(vm, state->data.v.map, options->data);
     if (vm->module == module) {
-        buffer = handlebars_vm_execute_program_ex(vm, program, input, NULL, TOP(vm->blockParamStack));
+        buffer = handlebars_vm_execute_program_ex(
+            vm,
+            program,
+            input,
+            &state->data,
+            NULL
+        );
     } else {
-        buffer = handlebars_vm_execute_ex(vm, module, input, program, NULL, TOP(vm->blockParamStack));
+        buffer = handlebars_vm_execute_ex_internal(
+            vm,
+            module,
+            input,
+            program,
+            &state->data,
+            NULL,
+            false
+        );
     }
     if (buffer) {
         handlebars_value_str(rv, buffer);
     }
 
-    // Pop partial block
-    if (pushed_partial_block) {
-        // This should never happen, but we need to convince scan-build of it
-        assert(vm->partialBlockStack != NULL);
-        if (!vm->partialBlockStack) return rv;
+done:
+    current_block_params = vm->blockParamStack;
+    error->jmp = prev_jmp;
+    if( vm->buffer != previous_buffer ) {
+        if( vm->buffer != NULL ) {
+            handlebars_string_delref(vm->buffer);
+        }
+        vm->buffer = previous_buffer;
+    }
+    handlebars_stack_restore(vm->stack, stack_save);
+    handlebars_stack_restore(vm->hashStack, hash_stack_save);
+    handlebars_stack_restore(vm->contextStack, context_stack_save);
+    handlebars_stack_restore(current_block_params, captured_block_params_save);
+    if( current_block_params != captured_block_params ) {
+        handlebars_stack_restore(captured_block_params, captured_block_params_save);
+    }
+    vm->blockParamStack = previous_block_params;
+    handlebars_stack_delref(current_block_params);
+    handlebars_stack_restore(vm->partialBlockStack, partial_block_stack_save);
+    handlebars_stack_restore(vm->partialScopeStack, partial_scope_stack_save);
+    vm->depth = previous_depth;
+    vm->data_proxy_count = state->data_proxy_count;
+    handlebars_value_dtor(&state->data);
+    handlebars_talloc_free(state);
 
-        HANDLEBARS_VALUE_DECL(closure_value);
-        POP(vm->partialBlockStack, closure_value);
-        HANDLEBARS_VALUE_UNDECL(closure_value);
+    if( caught != HANDLEBARS_SUCCESS && prev_jmp != NULL ) {
+        handlebars_longjmp(HBSCTX(vm), prev_jmp, caught);
     }
 
     return rv;
+}
+
+HANDLEBARS_CLOSURE_ATTRS
+static struct handlebars_value * invoke_inline_partial_closure(HANDLEBARS_CLOSURE_ARGS)
+{
+    assert(localc >= 4);
+    assert(HANDLEBARS_LOCAL_AT(0)->type == HANDLEBARS_VALUE_TYPE_PTR);
+    assert(HANDLEBARS_LOCAL_AT(1)->type == HANDLEBARS_VALUE_TYPE_INTEGER);
+    assert(HANDLEBARS_LOCAL_AT(2)->type == HANDLEBARS_VALUE_TYPE_ARRAY);
+    assert(HANDLEBARS_LOCAL_AT(3)->type == HANDLEBARS_VALUE_TYPE_ARRAY);
+
+    struct handlebars_module * module = handlebars_value_get_ptr(
+        HANDLEBARS_LOCAL_AT(0),
+        struct handlebars_module
+    );
+    long program = handlebars_value_get_intval(HANDLEBARS_LOCAL_AT(1));
+    struct handlebars_stack * captured_contexts = handlebars_value_get_stack(HANDLEBARS_LOCAL_AT(2));
+    struct handlebars_stack * captured_block_params = handlebars_value_get_stack(HANDLEBARS_LOCAL_AT(3));
+    struct handlebars_stack * previous_contexts = vm->contextStack;
+    struct handlebars_stack * previous_block_params = vm->blockParamStack;
+    struct handlebars_stack_save_buf captured_contexts_save = handlebars_stack_save(captured_contexts);
+    struct handlebars_stack_save_buf captured_block_params_save = handlebars_stack_save(captured_block_params);
+    struct handlebars_stack_save_buf stack_save = handlebars_stack_save(vm->stack);
+    struct handlebars_stack_save_buf hash_stack_save = handlebars_stack_save(vm->hashStack);
+    struct handlebars_stack_save_buf partial_block_stack_save = handlebars_stack_save(vm->partialBlockStack);
+    struct handlebars_stack_save_buf partial_scope_stack_save = handlebars_stack_save(vm->partialScopeStack);
+    struct handlebars_string * previous_buffer = vm->buffer;
+    long previous_depth = vm->depth;
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_stack * current_contexts;
+    struct handlebars_stack * current_block_params;
+    struct handlebars_value * input;
+    struct handlebars_string * buffer = NULL;
+    jmp_buf buf;
+
+    /* Keep the closure's snapshots alive while the VM uses copy-on-write
+     * working references. */
+    handlebars_stack_addref(captured_contexts);
+    handlebars_stack_addref(captured_block_params);
+    vm->contextStack = captured_contexts;
+    vm->blockParamStack = captured_block_params;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
+
+    input = argc > 0 ? &argv[0] : TOP(captured_contexts);
+    if( vm->module == module ) {
+        buffer = handlebars_vm_execute_program_ex(
+            vm,
+            program,
+            input,
+            options->data,
+            NULL
+        );
+    } else {
+        buffer = handlebars_vm_execute_ex_internal(
+            vm,
+            module,
+            input,
+            program,
+            options->data,
+            NULL,
+            false
+        );
+    }
+    if( buffer != NULL ) {
+        handlebars_value_str(rv, buffer);
+    }
+
+done:
+    current_contexts = vm->contextStack;
+    current_block_params = vm->blockParamStack;
+    error->jmp = prev_jmp;
+    if( vm->buffer != previous_buffer ) {
+        if( vm->buffer != NULL ) {
+            handlebars_string_delref(vm->buffer);
+        }
+        vm->buffer = previous_buffer;
+    }
+    handlebars_stack_restore(vm->stack, stack_save);
+    handlebars_stack_restore(vm->hashStack, hash_stack_save);
+    handlebars_stack_restore(current_contexts, captured_contexts_save);
+    if( current_contexts != captured_contexts ) {
+        handlebars_stack_restore(captured_contexts, captured_contexts_save);
+    }
+    handlebars_stack_restore(current_block_params, captured_block_params_save);
+    if( current_block_params != captured_block_params ) {
+        handlebars_stack_restore(captured_block_params, captured_block_params_save);
+    }
+    vm->contextStack = previous_contexts;
+    vm->blockParamStack = previous_block_params;
+    handlebars_stack_delref(current_contexts);
+    handlebars_stack_delref(current_block_params);
+    handlebars_stack_restore(vm->partialBlockStack, partial_block_stack_save);
+    handlebars_stack_restore(vm->partialScopeStack, partial_scope_stack_save);
+    vm->depth = previous_depth;
+
+    if( caught != HANDLEBARS_SUCCESS && prev_jmp != NULL ) {
+        handlebars_longjmp(HBSCTX(vm), prev_jmp, caught);
+    }
+    return rv;
+}
+
+#define INLINE_PARTIAL_MIN_OPCODE_COUNT 5
+#define INLINE_PARTIAL_CLOSURE_LOCAL_COUNT 4
+
+struct handlebars_inline_partial_install_state {
+    struct handlebars_value closure_localv[INLINE_PARTIAL_CLOSURE_LOCAL_COUNT];
+    struct handlebars_value closure_value;
+    struct handlebars_value scope_value;
+    struct handlebars_string * temporary_name;
+    struct handlebars_closure ** closures;
+    size_t closure_count;
+    size_t opcode_count;
+    size_t definition_count;
+};
+
+static bool handlebars_vm_inline_partial_name_opcode_is_valid(
+    const struct handlebars_opcode * opcode
+)
+{
+    if( opcode->type == handlebars_opcode_type_push_string ) {
+        return opcode->op1.type == handlebars_operand_type_string;
+    }
+    if( opcode->type != handlebars_opcode_type_push_literal ) {
+        return false;
+    }
+    return opcode->op1.type == handlebars_operand_type_boolean
+        || opcode->op1.type == handlebars_operand_type_long
+        || opcode->op1.type == handlebars_operand_type_double
+        || opcode->op1.type == handlebars_operand_type_string;
+}
+
+static struct handlebars_string * handlebars_vm_long_to_string(
+    struct handlebars_vm * vm,
+    long value
+)
+{
+    char buffer[sizeof(long) * CHAR_BIT + 2];
+    int printed = snprintf(buffer, sizeof(buffer), "%ld", value);
+
+    if( unlikely(printed < 0 || (size_t) printed >= sizeof(buffer)) ) {
+        handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Failed to format partial name");
+    }
+    return handlebars_string_ctor(CONTEXT, buffer, (size_t) printed);
+}
+
+static size_t handlebars_vm_inline_partial_opcode_range_length(
+    struct handlebars_opcode * opcodes,
+    size_t opcode_count,
+    size_t * program_opcode_offset
+)
+{
+    if( opcode_count < INLINE_PARTIAL_MIN_OPCODE_COUNT
+            || !handlebars_vm_inline_partial_name_opcode_is_valid(&opcodes[0]) ) {
+        return 0;
+    }
+
+    for( size_t candidate_offset = 1;
+            candidate_offset <= opcode_count - 4;
+            candidate_offset++ ) {
+        size_t hash_offset;
+        size_t registration_offset;
+
+        if( handlebars_opcode_is_statement_boundary(opcodes[candidate_offset].type) ) {
+            return 0;
+        }
+
+        if( opcodes[candidate_offset].type != handlebars_opcode_type_push_program
+                || opcodes[candidate_offset].op1.type != handlebars_operand_type_long
+                || opcodes[candidate_offset].op1.data.longval < 0
+                || !opcodes[candidate_offset].op4.data.boolval
+                || opcodes[candidate_offset + 1].type != handlebars_opcode_type_push_program
+                || opcodes[candidate_offset + 1].op1.type != handlebars_operand_type_null ) {
+            continue;
+        }
+
+        hash_offset = candidate_offset + 2;
+        if( opcodes[hash_offset].type == handlebars_opcode_type_empty_hash ) {
+            registration_offset = hash_offset + 1;
+        } else if( opcodes[hash_offset].type == handlebars_opcode_type_push_hash ) {
+            size_t hash_depth = 1;
+            bool found_pop_hash = false;
+
+            for( size_t i = hash_offset + 1; i < opcode_count; i++ ) {
+                if( handlebars_opcode_is_statement_boundary(opcodes[i].type) ) {
+                    return 0;
+                }
+                if( opcodes[i].type == handlebars_opcode_type_push_hash ) {
+                    hash_depth++;
+                } else if( opcodes[i].type == handlebars_opcode_type_pop_hash ) {
+                    if( hash_depth == 1 ) {
+                        registration_offset = i + 1;
+                        found_pop_hash = true;
+                        break;
+                    }
+                    hash_depth--;
+                }
+            }
+            if( !found_pop_hash ) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        if( registration_offset >= opcode_count ) {
+            continue;
+        }
+
+        if( opcodes[registration_offset].type == handlebars_opcode_type_register_decorator
+                && opcodes[registration_offset].op1.type == handlebars_operand_type_long
+                && opcodes[registration_offset].op1.data.longval >= 1
+                && opcodes[registration_offset].op2.type == handlebars_operand_type_string
+                && hbs_str_eq_strl(
+                    opcodes[registration_offset].op2.data.string.string,
+                    HBS_STRL("inline")
+                )
+                && opcodes[registration_offset].op3.type == handlebars_operand_type_boolean
+                && opcodes[registration_offset].op3.data.boolval ) {
+            if( program_opcode_offset != NULL ) {
+                *program_opcode_offset = candidate_offset;
+            }
+            return registration_offset + 1;
+        }
+    }
+
+    return 0;
+}
+
+static struct handlebars_string * handlebars_vm_inline_partial_name(
+    struct handlebars_vm * vm,
+    struct handlebars_inline_partial_install_state * state,
+    const struct handlebars_opcode * opcode
+)
+{
+    const char * value;
+    size_t length;
+
+    assert(handlebars_vm_inline_partial_name_opcode_is_valid(opcode));
+    assert(state->temporary_name == NULL);
+
+    if( opcode->op1.type == handlebars_operand_type_string ) {
+        return opcode->op1.data.string.string;
+    }
+    if( opcode->op1.type == handlebars_operand_type_double ) {
+        state->temporary_name = handlebars_string_from_double(
+            CONTEXT,
+            opcode->op1.data.doubleval
+        );
+        handlebars_string_addref(state->temporary_name);
+        return state->temporary_name;
+    }
+    if( opcode->op1.type == handlebars_operand_type_boolean ) {
+        if( opcode->op1.data.boolval ) {
+            value = "true";
+            length = sizeof("true") - 1;
+        } else {
+            value = "false";
+            length = sizeof("false") - 1;
+        }
+    } else {
+        assert(opcode->op1.type == handlebars_operand_type_long);
+        state->temporary_name = handlebars_vm_long_to_string(
+            vm,
+            opcode->op1.data.longval
+        );
+        handlebars_string_addref(state->temporary_name);
+        return state->temporary_name;
+    }
+
+    state->temporary_name = handlebars_string_ctor(CONTEXT, value, length);
+    handlebars_string_addref(state->temporary_name);
+    return state->temporary_name;
+}
+
+static void handlebars_vm_release_inline_partial_name(
+    struct handlebars_inline_partial_install_state * state
+)
+{
+    if( state->temporary_name == NULL ) {
+        return;
+    }
+#ifdef HANDLEBARS_NO_REFCOUNT
+    handlebars_talloc_free(state->temporary_name);
+#else
+    handlebars_string_delref(state->temporary_name);
+#endif
+    state->temporary_name = NULL;
+}
+
+static void handlebars_vm_clear_inline_partial_install_values(
+    struct handlebars_inline_partial_install_state * state
+)
+{
+    for( int i = 0; i < INLINE_PARTIAL_CLOSURE_LOCAL_COUNT; i++ ) {
+        handlebars_value_dtor(&state->closure_localv[i]);
+    }
+    handlebars_value_dtor(&state->closure_value);
+    handlebars_vm_release_inline_partial_name(state);
+}
+
+static void handlebars_vm_install_inline_partial_scope(
+    struct handlebars_vm * vm,
+    struct handlebars_module_table_entry * entry,
+    size_t opcode_count,
+    size_t definition_count,
+    bool capture_current_context
+)
+{
+    struct handlebars_error * error;
+    jmp_buf * volatile prev_jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_inline_partial_install_state * state;
+    jmp_buf buf;
+
+    state = handlebars_talloc_zero(vm, struct handlebars_inline_partial_install_state);
+    HANDLEBARS_MEMCHECK(state, CONTEXT);
+    state->opcode_count = opcode_count;
+    state->definition_count = definition_count;
+    error = HBSCTX(vm)->e;
+    prev_jmp = error->jmp;
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
+
+    state->closures = handlebars_talloc_array(
+        state,
+        struct handlebars_closure *,
+        state->definition_count
+    );
+    HANDLEBARS_MEMCHECK(state->closures, CONTEXT);
+    handlebars_value_map(
+        &state->scope_value,
+        handlebars_map_ctor(CONTEXT, state->definition_count)
+    );
+    talloc_steal(state, handlebars_value_get_map(&state->scope_value));
+
+    for( size_t offset = 0; offset < state->opcode_count; ) {
+        struct handlebars_opcode * opcodes = &vm->module->opcodes[
+            entry->opcode_offset + offset
+        ];
+        size_t program_opcode_offset = 0;
+        size_t range_length = handlebars_vm_inline_partial_opcode_range_length(
+            opcodes,
+            state->opcode_count - offset,
+            &program_opcode_offset
+        );
+        struct handlebars_value * previous;
+        size_t previous_closure_index = SIZE_MAX;
+        struct handlebars_string * name;
+        struct handlebars_ptr * module_ptr;
+        struct handlebars_stack * captured_contexts;
+        struct handlebars_stack * captured_block_params;
+        struct handlebars_closure * closure;
+
+        assert(range_length > 0);
+        name = handlebars_vm_inline_partial_name(vm, state, &opcodes[0]);
+        module_ptr = handlebars_ptr_ctor(
+            CONTEXT,
+            struct handlebars_module,
+            vm->module,
+            true
+        );
+        talloc_steal(state, module_ptr);
+        handlebars_value_ptr(&state->closure_localv[0], module_ptr);
+        handlebars_value_integer(
+            &state->closure_localv[1],
+            opcodes[program_opcode_offset].op1.data.longval
+        );
+
+        captured_contexts = handlebars_stack_copy_ctor(
+            vm->contextStack,
+            HANDLEBARS_VM_STACK_SIZE
+        );
+        if( !capture_current_context
+                && handlebars_stack_count(captured_contexts) > 0 ) {
+            size_t parent_count = handlebars_stack_count(captured_contexts) - 1;
+            handlebars_stack_protect(captured_contexts, 0);
+            handlebars_stack_truncate(captured_contexts, parent_count);
+            handlebars_stack_protect(captured_contexts, parent_count);
+        }
+        talloc_steal(state, captured_contexts);
+        handlebars_value_array(&state->closure_localv[2], captured_contexts);
+
+        captured_block_params = handlebars_stack_copy_ctor(
+            vm->blockParamStack,
+            HANDLEBARS_VM_STACK_SIZE
+        );
+        talloc_steal(state, captured_block_params);
+        handlebars_value_array(&state->closure_localv[3], captured_block_params);
+
+        closure = handlebars_closure_ctor(
+            vm,
+            invoke_inline_partial_closure,
+            INLINE_PARTIAL_CLOSURE_LOCAL_COUNT,
+            state->closure_localv
+        );
+        talloc_steal(state, closure);
+        talloc_steal(closure, module_ptr);
+        talloc_steal(closure, captured_contexts);
+        talloc_steal(closure, captured_block_params);
+        handlebars_value_closure(&state->closure_value, closure);
+
+        previous = handlebars_map_find(
+            handlebars_value_get_map(&state->scope_value),
+            name
+        );
+        if( previous != NULL
+                && handlebars_value_get_type(previous) == HANDLEBARS_VALUE_TYPE_CLOSURE ) {
+            struct handlebars_closure * previous_closure = handlebars_value_get_closure(
+                previous
+            );
+            for( size_t i = 0; i < state->closure_count; i++ ) {
+                if( state->closures[i] == previous_closure ) {
+                    previous_closure_index = i;
+                    break;
+                }
+            }
+        }
+        handlebars_value_map_update(
+            &state->scope_value,
+            name,
+            &state->closure_value
+        );
+        talloc_steal(state, handlebars_value_get_map(&state->scope_value));
+        if( previous_closure_index != SIZE_MAX ) {
+            state->closures[previous_closure_index] = NULL;
+        }
+        state->closures[state->closure_count++] = closure;
+        handlebars_vm_clear_inline_partial_install_values(state);
+        offset += range_length;
+    }
+
+    PUSH(vm->partialScopeStack, &state->scope_value);
+    talloc_steal(vm, handlebars_value_get_map(&state->scope_value));
+    for( size_t i = 0; i < state->closure_count; i++ ) {
+        if( state->closures[i] != NULL ) {
+            talloc_steal(vm, state->closures[i]);
+        }
+    }
+
+done:
+    error->jmp = prev_jmp;
+    handlebars_vm_clear_inline_partial_install_values(state);
+    handlebars_value_dtor(&state->scope_value);
+    handlebars_talloc_free(state);
+
+    if( caught != HANDLEBARS_SUCCESS && prev_jmp != NULL ) {
+        handlebars_longjmp(HBSCTX(vm), prev_jmp, caught);
+    }
+}
+
+static size_t handlebars_vm_install_inline_partials(
+    struct handlebars_vm * vm,
+    struct handlebars_module_table_entry * entry,
+    bool capture_current_context
+)
+{
+    size_t consumed = 0;
+    size_t definition_count = 0;
+
+    while( consumed < entry->opcode_count ) {
+        size_t range_length = handlebars_vm_inline_partial_opcode_range_length(
+            &vm->module->opcodes[entry->opcode_offset + consumed],
+            entry->opcode_count - consumed,
+            NULL
+        );
+
+        if( range_length == 0 ) {
+            break;
+        }
+        consumed += range_length;
+        definition_count++;
+    }
+    if( definition_count > 0 ) {
+        handlebars_vm_install_inline_partial_scope(
+            vm,
+            entry,
+            consumed,
+            definition_count,
+            capture_current_context
+        );
+    }
+    return consumed;
 }
 
 HANDLEBARS_CLOSURE_ATTRS
@@ -471,6 +1899,7 @@ static struct handlebars_value * invoke_partial_string_closure(HANDLEBARS_CLOSUR
         vm,
         tmpl,
         &argv[0],
+        options->data,
         indent,
         0,
         0
@@ -502,7 +1931,15 @@ static struct handlebars_value * invoke_mustache_style_lambda_closure(HANDLEBARS
 
     if (!handlebars_value_is_empty(lambda_result)) {
         struct handlebars_string * tmpl = handlebars_value_to_string(lambda_result, CONTEXT);
-        struct handlebars_string * rv_str = execute_template(vm, tmpl, callable, NULL, 0, use_delimiters);
+        struct handlebars_string * rv_str = execute_template(
+            vm,
+            tmpl,
+            callable,
+            options->data,
+            NULL,
+            0,
+            use_delimiters
+        );
         handlebars_value_str(rv, rv_str);
     }
 
@@ -512,32 +1949,123 @@ static struct handlebars_value * invoke_mustache_style_lambda_closure(HANDLEBARS
     return rv;
 }
 
+struct handlebars_helper_call_state {
+    struct handlebars_options options;
+    struct handlebars_value * argv;
+    struct handlebars_value extra[5];
+    struct handlebars_value rv;
+    struct handlebars_value fnv;
+    struct handlebars_value value;
+    struct handlebars_string * temporary_name;
+    struct handlebars_vm_call_checkpoint checkpoint;
+    int argc;
+};
 
-
-
-
-
-ACCEPT_FUNCTION(ambiguous_block_value)
+static void handlebars_helper_call_state_init(
+    struct handlebars_helper_call_state * state,
+    struct handlebars_value * argv
+)
 {
-    HANDLEBARS_VALUE_DECL(rv);
+    memset(state, 0, sizeof(*state));
+    state->argv = argv;
+}
 
-    if( vm->last_helper == NULL ) {
-        VM_SETUP_OPTIONS(1);
-        struct handlebars_value * result = handlebars_vm_call_helper_str(HBS_STRL("blockHelperMissing"), 1, argv, &options, vm, rv);
-        assert(result != NULL);
-        PUSH(vm->stack, result);
-        VM_TEARDOWN_OPTIONS(1);
-    } else if (hbs_str_eq_strl(vm->last_helper, HBS_STRL("lambda"))) {
-        VM_SETUP_OPTIONS(0);
-        handlebars_string_delref(vm->last_helper);
-        vm->last_helper = NULL;
-        VM_TEARDOWN_OPTIONS(0);
-    } else {
-        VM_SETUP_OPTIONS(0);
-        VM_TEARDOWN_OPTIONS(0);
+static void handlebars_helper_call_state_deinit(
+    struct handlebars_helper_call_state * state
+)
+{
+    if( state->temporary_name != NULL ) {
+        handlebars_string_delref(state->temporary_name);
+    }
+    for( int i = 0; i < 5; i++ ) {
+        handlebars_value_dtor(&state->extra[i]);
+    }
+    for( int i = 0; i < state->argc; i++ ) {
+        handlebars_value_dtor(&state->argv[i]);
+    }
+    handlebars_options_deinit(&state->options);
+    handlebars_value_dtor(&state->value);
+    handlebars_value_dtor(&state->fnv);
+    handlebars_value_dtor(&state->rv);
+}
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void accept_ambiguous_block_value_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_opcode * opcode,
+    struct handlebars_helper_call_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
     }
 
-    HANDLEBARS_VALUE_UNDECL(rv);
+    if( vm->last_helper == NULL ) {
+        struct handlebars_value * result;
+
+        state->argc = 1;
+        setup_options(
+            vm,
+            state->argc,
+            state->argv,
+            &state->options,
+            state->extra
+        );
+        handlebars_vm_call_checkpoint_begin(vm, &state->checkpoint);
+        result = handlebars_vm_call_helper_str(
+            HBS_STRL("blockHelperMissing"),
+            state->argc,
+            state->argv,
+            &state->options,
+            vm,
+            &state->rv
+        );
+        assert(result != NULL);
+        PUSH(vm->stack, result);
+    } else if (hbs_str_eq_strl(vm->last_helper, HBS_STRL("lambda"))) {
+        setup_options(
+            vm,
+            state->argc,
+            state->argv,
+            &state->options,
+            state->extra
+        );
+        handlebars_string_delref(vm->last_helper);
+        vm->last_helper = NULL;
+    } else {
+        setup_options(
+            vm,
+            state->argc,
+            state->argv,
+            &state->options,
+            state->extra
+        );
+    }
+
+done:
+    error->jmp = prev_jmp;
+    handlebars_vm_call_checkpoint_finish(vm, &state->checkpoint, caught);
+    handlebars_helper_call_state_deinit(state);
+
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, prev_jmp, caught);
+    }
+}
+
+ACCEPT_NOINLINE_FUNCTION(ambiguous_block_value)
+{
+    HANDLEBARS_VALUE_ARRAY_DECL(argv, 1);
+    struct handlebars_helper_call_state state;
+
+    handlebars_helper_call_state_init(&state, argv);
+    accept_ambiguous_block_value_guarded(vm, opcode, &state);
+    HANDLEBARS_VALUE_ARRAY_UNDECL(argv, 0);
 }
 
 ACCEPT_FUNCTION(append)
@@ -591,23 +2119,69 @@ ACCEPT_FUNCTION(assign_to_hash)
     HANDLEBARS_VALUE_UNDECL(hash);
 }
 
-ACCEPT_FUNCTION(block_value)
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void accept_block_value_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_opcode * opcode,
+    struct handlebars_helper_call_state * state
+)
 {
-    const int argc = 1;
-    HANDLEBARS_VALUE_DECL(rv);
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_value * result;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
 
     assert(opcode->op1.type == handlebars_operand_type_string);
 
-    VM_SETUP_OPTIONS(argc);
-    options.name = opcode->op1.data.string.string;
+    state->argc = 1;
+    setup_options(
+        vm,
+        state->argc,
+        state->argv,
+        &state->options,
+        state->extra
+    );
+    state->options.name = opcode->op1.data.string.string;
+    handlebars_vm_call_checkpoint_begin(vm, &state->checkpoint);
 
-    struct handlebars_value * result = handlebars_vm_call_helper_str(HBS_STRL("blockHelperMissing"), argc, argv, &options, vm, rv);
+    result = handlebars_vm_call_helper_str(
+        HBS_STRL("blockHelperMissing"),
+        state->argc,
+        state->argv,
+        &state->options,
+        vm,
+        &state->rv
+    );
+    /* append_to_buffer may replace the borrowed buffer snapshot. */
+    handlebars_vm_call_checkpoint_commit(vm, &state->checkpoint);
     if (likely(result != NULL)) {
         append_to_buffer(vm, result, 0);
     }
 
-    VM_TEARDOWN_OPTIONS(argc);
-    HANDLEBARS_VALUE_UNDECL(rv);
+done:
+    error->jmp = prev_jmp;
+    handlebars_vm_call_checkpoint_finish(vm, &state->checkpoint, caught);
+    handlebars_helper_call_state_deinit(state);
+
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, prev_jmp, caught);
+    }
+}
+
+ACCEPT_NOINLINE_FUNCTION(block_value)
+{
+    HANDLEBARS_VALUE_ARRAY_DECL(argv, 1);
+    struct handlebars_helper_call_state state;
+
+    handlebars_helper_call_state_init(&state, argv);
+    accept_block_value_guarded(vm, opcode, &state);
+    HANDLEBARS_VALUE_ARRAY_UNDECL(argv, 0);
 }
 
 ACCEPT_FUNCTION(empty_hash)
@@ -637,126 +2211,294 @@ ACCEPT_FUNCTION(get_context)
     }
 }
 
-ACCEPT_FUNCTION(invoke_ambiguous)
+struct handlebars_ambiguous_call_state {
+    struct handlebars_options options;
+    struct handlebars_value argv[1];
+    struct handlebars_value extra[5];
+    struct handlebars_value closure_localv[3];
+    struct handlebars_value rv;
+    struct handlebars_value value;
+    struct handlebars_value fnv;
+    struct handlebars_string * last_helper;
+};
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void accept_invoke_ambiguous_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_opcode * opcode,
+    struct handlebars_ambiguous_call_state * state
+)
 {
-    HANDLEBARS_VALUE_DECL(rv);
-    HANDLEBARS_VALUE_DECL(value);
-    HANDLEBARS_VALUE_DECL(fnv);
+    const int argc = 0;
+    const int closure_localc = 3;
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    long previous_depth = vm->depth;
     struct handlebars_value * result;
     struct handlebars_value * fn;
-    struct handlebars_string * last_helper = NULL;
+    bool is_callable;
+    jmp_buf buf;
 
-    HBS_ASSERT(POP(vm->stack, value));
-    const int argc = 0;
-    bool is_callable = handlebars_value_is_callable(value);
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
+
+    HBS_ASSERT(POP(vm->stack, &state->value));
+    is_callable = handlebars_value_is_callable(&state->value);
 
     ACCEPT_FN(empty_hash)(vm, opcode);
 
     assert(opcode->op1.type == handlebars_operand_type_string);
     assert(opcode->op2.type == handlebars_operand_type_boolean);
 
-    VM_SETUP_OPTIONS(argc);
-    options.name = opcode->op1.data.string.string;
+    setup_options(vm, argc, state->argv, &state->options, state->extra);
+    state->options.name = opcode->op1.data.string.string;
     if( vm->last_helper != NULL ) {
         handlebars_string_delref(vm->last_helper);
     }
     vm->last_helper = NULL;
 
-    if (vm->flags & handlebars_compiler_flag_mustache_style_lambdas && is_callable) {
+    if( vm->flags & handlebars_compiler_flag_mustache_style_lambdas
+            && is_callable ) {
+        struct handlebars_closure * closure;
+
         assert(opcode->op3.type == handlebars_operand_type_string);
+        handlebars_value_value(&state->closure_localv[0], &state->value);
+        handlebars_value_str(
+            &state->closure_localv[1],
+            opcode->op3.data.string.string
+        );
+        handlebars_value_boolean(
+            &state->closure_localv[2],
+            opcode->op2.data.boolval
+        );
 
-        // Construct a closure of the lambda
-        const int closure_localc = 3;
-        HANDLEBARS_VALUE_ARRAY_DECL(closure_localv, closure_localc);
+        closure = handlebars_closure_ctor(
+            vm,
+            invoke_mustache_style_lambda_closure,
+            closure_localc,
+            state->closure_localv
+        );
+        handlebars_value_closure(&state->value, closure);
+        fn = &state->value;
 
-        handlebars_value_value(&closure_localv[0], value);
-        handlebars_value_str(&closure_localv[1], opcode->op3.data.string.string);
-        handlebars_value_boolean(&closure_localv[2], opcode->op2.data.boolval);
-
-        struct handlebars_closure * closure = handlebars_closure_ctor(vm, invoke_mustache_style_lambda_closure, closure_localc, closure_localv);
-        handlebars_value_closure(value, closure);
-        fn = value;
-
-        last_helper = handlebars_string_ctor(CONTEXT, HBS_STRL("lambda")); // hackey but it works
-        handlebars_string_addref(last_helper);
-
-        HANDLEBARS_VALUE_ARRAY_UNDECL(closure_localv, closure_localc);
-    } else if( NULL != (fn = lookup_helper(vm, options.name, fnv)) ) {
-        last_helper = options.name;
-        handlebars_string_addref(last_helper);
-    } else if (value && is_callable) {
-        fn = value;
+        state->last_helper = handlebars_string_ctor(
+            CONTEXT,
+            HBS_STRL("lambda")
+        );
+        handlebars_string_addref(state->last_helper);
+    } else if( NULL != (fn = lookup_helper(
+            vm,
+            state->options.name,
+            &state->fnv
+        )) ) {
+        state->last_helper = state->options.name;
+        handlebars_string_addref(state->last_helper);
+    } else if( is_callable ) {
+        fn = &state->value;
     } else {
-        struct handlebars_string * tmp_str = handlebars_string_ctor(CONTEXT, HBS_STRL("helperMissing"));
-        fn = lookup_helper(vm, tmp_str, fnv);
+        struct handlebars_string * tmp_str = handlebars_string_ctor(
+            CONTEXT,
+            HBS_STRL("helperMissing")
+        );
+        fn = lookup_helper(vm, tmp_str, &state->fnv);
         handlebars_string_delref(tmp_str);
     }
 
-    result = handlebars_value_call(fn, argc, argv, &options, vm, rv);
+    result = handlebars_value_call(
+        fn,
+        argc,
+        state->argv,
+        &state->options,
+        vm,
+        &state->rv
+    );
 
     // Before, the null case was only done for helperMissing
-    if (result->type != HANDLEBARS_VALUE_TYPE_NULL) {
+    if( result->type != HANDLEBARS_VALUE_TYPE_NULL ) {
         PUSH(vm->stack, result);
     } else {
-        PUSH(vm->stack, value);
+        PUSH(vm->stack, &state->value);
     }
 
-    vm->last_helper = last_helper;
+    vm->last_helper = state->last_helper;
+    state->last_helper = NULL;
 
-    VM_TEARDOWN_OPTIONS(argc);
-    HANDLEBARS_VALUE_UNDECL(fnv);
-    HANDLEBARS_VALUE_UNDECL(value);
-    HANDLEBARS_VALUE_UNDECL(rv);
+done:
+    error->jmp = prev_jmp;
+    if( state->last_helper != NULL ) {
+        handlebars_string_delref(state->last_helper);
+    }
+    for( int i = 0; i < closure_localc; i++ ) {
+        handlebars_value_dtor(&state->closure_localv[i]);
+    }
+    for( int i = 0; i < 5; i++ ) {
+        handlebars_value_dtor(&state->extra[i]);
+    }
+    handlebars_value_dtor(&state->argv[0]);
+    handlebars_options_deinit(&state->options);
+    handlebars_value_dtor(&state->fnv);
+    handlebars_value_dtor(&state->value);
+    handlebars_value_dtor(&state->rv);
+    vm->depth = previous_depth;
+
+    if( caught != HANDLEBARS_SUCCESS && prev_jmp != NULL ) {
+        handlebars_longjmp(HBSCTX(vm), prev_jmp, caught);
+    }
 }
 
-ACCEPT_FUNCTION(invoke_helper)
+ACCEPT_NOINLINE_FUNCTION(invoke_ambiguous)
 {
-    HANDLEBARS_VALUE_DECL(value);
-    HANDLEBARS_VALUE_DECL(rv);
-    HANDLEBARS_VALUE_DECL(fnv);
-    struct handlebars_value * fn;
+    struct handlebars_ambiguous_call_state state;
 
-    HBS_ASSERT(POP(vm->stack, value));
+    memset(&state.options, 0, sizeof(state.options));
+    handlebars_value_init(&state.argv[0]);
+    for( int i = 0; i < 5; i++ ) {
+        handlebars_value_init(&state.extra[i]);
+    }
+    for( int i = 0; i < 3; i++ ) {
+        handlebars_value_init(&state.closure_localv[i]);
+    }
+    handlebars_value_init(&state.rv);
+    handlebars_value_init(&state.value);
+    handlebars_value_init(&state.fnv);
+    state.last_helper = NULL;
+
+    accept_invoke_ambiguous_guarded(vm, opcode, &state);
+}
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void accept_invoke_helper_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_opcode * opcode,
+    struct handlebars_helper_call_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_value * fn;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
+
+    HBS_ASSERT(POP(vm->stack, &state->value));
 
     assert(opcode->op1.type == handlebars_operand_type_long);
     assert(opcode->op2.type == handlebars_operand_type_string);
     assert(opcode->op3.type == handlebars_operand_type_boolean);
 
-    int argc = (int) opcode->op1.data.longval;
-    VM_SETUP_OPTIONS(argc);
-    options.name = opcode->op2.data.string.string;
+    setup_options(
+        vm,
+        state->argc,
+        state->argv,
+        &state->options,
+        state->extra
+    );
+    state->options.name = opcode->op2.data.string.string;
+    handlebars_vm_call_checkpoint_begin(vm, &state->checkpoint);
 
-    if (opcode->op3.data.boolval && NULL != (fn = lookup_helper(vm, options.name, fnv))) { // isSimple
+    if (opcode->op3.data.boolval && NULL != (fn = lookup_helper(
+            vm,
+            state->options.name,
+            &state->fnv
+        ))) { // isSimple
         // fallthrough
-    } else if (value && handlebars_value_is_callable(value)) {
-        fn = value;
+    } else if (handlebars_value_is_callable(&state->value)) {
+        fn = &state->value;
+    } else if (unlikely(helper_context_is_truthy(&state->value))) {
+        handlebars_throw_ex(
+            CONTEXT,
+            HANDLEBARS_ERROR,
+            &opcode->loc,
+            "Value for helper \"%.*s\" is not callable",
+            (int) hbs_str_len(state->options.name),
+            hbs_str_val(state->options.name)
+        );
     } else {
-        struct handlebars_string * tmp_str = handlebars_string_ctor(CONTEXT, HBS_STRL("helperMissing"));
-        fn = lookup_helper(vm, tmp_str, fnv);
-        handlebars_string_delref(tmp_str);
+        state->temporary_name = handlebars_string_ctor(
+            CONTEXT,
+            HBS_STRL("helperMissing")
+        );
+        fn = lookup_helper(vm, state->temporary_name, &state->fnv);
+        handlebars_string_delref(state->temporary_name);
+        state->temporary_name = NULL;
     }
 
-    PUSH(vm->stack, handlebars_value_call(fn, argc, argv, &options, vm, rv));
+    PUSH(
+        vm->stack,
+        handlebars_value_call(
+            fn,
+            state->argc,
+            state->argv,
+            &state->options,
+            vm,
+            &state->rv
+        )
+    );
 
-    VM_TEARDOWN_OPTIONS(argc);
-    HANDLEBARS_VALUE_UNDECL(fnv);
-    HANDLEBARS_VALUE_UNDECL(rv);
-    HANDLEBARS_VALUE_UNDECL(value);
+done:
+    error->jmp = prev_jmp;
+    handlebars_vm_call_checkpoint_finish(vm, &state->checkpoint, caught);
+    handlebars_helper_call_state_deinit(state);
+
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, prev_jmp, caught);
+    }
 }
 
-ACCEPT_FUNCTION(invoke_known_helper)
+ACCEPT_NOINLINE_FUNCTION(invoke_helper)
 {
-    HANDLEBARS_VALUE_DECL(rv);
-    HANDLEBARS_VALUE_DECL(fnv);
+    int argc;
+    struct handlebars_helper_call_state state;
+
+    assert(opcode->op1.type == handlebars_operand_type_long);
+    argc = (int) opcode->op1.data.longval;
+    HANDLEBARS_VALUE_ARRAY_DECL(argv, argc);
+
+    handlebars_helper_call_state_init(&state, argv);
+    state.argc = argc;
+    accept_invoke_helper_guarded(vm, opcode, &state);
+    HANDLEBARS_VALUE_ARRAY_UNDECL(argv, 0);
+}
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void accept_invoke_known_helper_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_opcode * opcode,
+    struct handlebars_helper_call_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_value * fn;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
 
     assert(opcode->op1.type == handlebars_operand_type_long);
     assert(opcode->op2.type == handlebars_operand_type_string);
 
-    int argc = (int) opcode->op1.data.longval;
-    VM_SETUP_OPTIONS(argc);
-    options.name = opcode->op2.data.string.string;
+    setup_options(
+        vm,
+        state->argc,
+        state->argv,
+        &state->options,
+        state->extra
+    );
+    state->options.name = opcode->op2.data.string.string;
+    handlebars_vm_call_checkpoint_begin(vm, &state->checkpoint);
 
-    struct handlebars_value * fn = lookup_helper(vm, options.name, fnv);
+    fn = lookup_helper(vm, state->options.name, &state->fnv);
 
     if (unlikely(fn == NULL)) {
         handlebars_throw_ex(
@@ -764,79 +2506,248 @@ ACCEPT_FUNCTION(invoke_known_helper)
             HANDLEBARS_ERROR,
             &opcode->loc,
             "Invalid known helper: %.*s",
-            (int) hbs_str_len(options.name),
-            hbs_str_val(options.name)
+            (int) hbs_str_len(state->options.name),
+            hbs_str_val(state->options.name)
         );
     }
 
-    PUSH(vm->stack, handlebars_value_call(fn, argc, argv, &options, vm, rv));
+    PUSH(
+        vm->stack,
+        handlebars_value_call(
+            fn,
+            state->argc,
+            state->argv,
+            &state->options,
+            vm,
+            &state->rv
+        )
+    );
 
-    VM_TEARDOWN_OPTIONS(argc);
-    HANDLEBARS_VALUE_UNDECL(fnv);
-    HANDLEBARS_VALUE_UNDECL(rv);
+done:
+    error->jmp = prev_jmp;
+    handlebars_vm_call_checkpoint_finish(vm, &state->checkpoint, caught);
+    handlebars_helper_call_state_deinit(state);
+
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, prev_jmp, caught);
+    }
 }
 
-ACCEPT_FUNCTION(invoke_partial)
+ACCEPT_NOINLINE_FUNCTION(invoke_known_helper)
+{
+    int argc;
+    struct handlebars_helper_call_state state;
+
+    assert(opcode->op1.type == handlebars_operand_type_long);
+    argc = (int) opcode->op1.data.longval;
+    HANDLEBARS_VALUE_ARRAY_DECL(argv, argc);
+
+    handlebars_helper_call_state_init(&state, argv);
+    state.argc = argc;
+    accept_invoke_known_helper_guarded(vm, opcode, &state);
+    HANDLEBARS_VALUE_ARRAY_UNDECL(argv, 0);
+}
+
+struct handlebars_partial_call_state {
+    struct handlebars_options options;
+    struct handlebars_value argv[1];
+    struct handlebars_value extra[5];
+    struct handlebars_value partial_block_localv[5];
+    struct handlebars_value partial_string_localv[2];
+    struct handlebars_value tmp;
+    struct handlebars_value partial_rv;
+    struct handlebars_value rv;
+    struct handlebars_value partial_block;
+    struct handlebars_value partial_data;
+    struct handlebars_string * temporary_name;
+    struct handlebars_string * buffer;
+    struct handlebars_stack_save_buf inline_scope_save;
+    bool inline_scope_saved;
+    bool pushed_partial_block;
+    size_t data_proxy_count;
+};
+
+ACCEPT_NOINLINE_FUNCTION(invoke_partial)
 {
     const int argc = 1;
-    struct handlebars_string * name = NULL;
-    struct handlebars_value * partial = NULL;
-    HANDLEBARS_VALUE_DECL(tmp);
-    HANDLEBARS_VALUE_DECL(partial_rv);
-    HANDLEBARS_VALUE_DECL(rv);
-    HANDLEBARS_VALUE_DECL(partial_block);
-    struct handlebars_string * buffer = NULL;
-    bool pushed_partial_block = false;
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile prev_jmp = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    long previous_depth = vm->depth;
+    struct handlebars_partial_call_state * state = handlebars_talloc_zero(
+        vm,
+        struct handlebars_partial_call_state
+    );
+    struct handlebars_options * options;
+    struct handlebars_value * argv;
+    struct handlebars_value * extra;
+    struct handlebars_value * tmp;
+    struct handlebars_value * partial_rv;
+    struct handlebars_value * rv;
+    struct handlebars_value * partial_block;
+    struct handlebars_string * name;
+    struct handlebars_value * partial;
+    jmp_buf buf;
 
+    HANDLEBARS_MEMCHECK(state, CONTEXT);
+    state->data_proxy_count = vm->data_proxy_count;
+    options = &state->options;
+    argv = state->argv;
+    extra = state->extra;
+    tmp = &state->tmp;
+    partial_rv = &state->partial_rv;
+    rv = &state->rv;
+    partial_block = &state->partial_block;
     assert(opcode->op1.type == handlebars_operand_type_boolean);
     assert(opcode->op2.type == handlebars_operand_type_string || opcode->op2.type == handlebars_operand_type_null || opcode->op2.type == handlebars_operand_type_long);
     assert(opcode->op3.type == handlebars_operand_type_string);
 
-    VM_SETUP_OPTIONS(argc);
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
 
+    setup_options(vm, argc, argv, options, extra);
+    state->inline_scope_save = handlebars_stack_save(vm->partialScopeStack);
+    state->inline_scope_saved = true;
+    if( unlikely(options->program >= (long) vm->module->program_count) ) {
+        handlebars_throw(
+            CONTEXT,
+            HANDLEBARS_ERROR,
+            "Invalid program: %ld",
+            options->program
+        );
+    }
+    name = NULL;
+    partial = NULL;
     if( opcode->op1.data.boolval ) {
         // Dynamic partial
         HBS_ASSERT(POP(vm->stack, tmp));
         name = handlebars_value_get_string(tmp);
-        options.name = NULL; // fear
+        options->name = NULL; // fear
     } else {
         if( opcode->op2.type == handlebars_operand_type_long ) {
-            char tmp_str[32];
-            size_t tmp_str_len = snprintf(tmp_str, 32, "%ld", opcode->op2.data.longval);
-            name = handlebars_string_ctor(HBSCTX(vm), tmp_str, tmp_str_len);
-            //name = MC(handlebars_talloc_asprintf(vm, "%ld", opcode->op2.data.longval));
+            state->temporary_name = handlebars_vm_long_to_string(
+                vm,
+                opcode->op2.data.longval
+            );
+            talloc_steal(state, state->temporary_name);
+            name = state->temporary_name;
         } else if( opcode->op2.type == handlebars_operand_type_string ) {
             name = opcode->op2.data.string.string;
         }
     }
 
     if (name) {
-        partial = handlebars_value_map_find(&vm->partials, name, partial_rv);
+        partial = lookup_partial(vm, name, partial_rv);
     }
 
     // Try to look up partial block
-    if (!partial && name && hbs_str_eq_strl(name, HBS_STRL("@partial-block")) && LEN(vm->partialBlockStack) > 0) {
-        partial = TOP(vm->partialBlockStack);
+    if( !partial
+            && name
+            && hbs_str_eq_strl(name, HBS_STRL("@partial-block")) ) {
+        partial = handlebars_vm_lookup_data_map_str_find(
+            vm,
+            options->data,
+            HBS_STRL("partial-block"),
+            partial_rv
+        );
     }
 
     // Push partial block
-    if (options.program > 0) {
-        const int closure_localc = 3;
-        HANDLEBARS_VALUE_ARRAY_DECL(closure_localv, closure_localc);
+    if (options->program > 0) {
+        const int closure_localc = 5;
+        struct handlebars_value * closure_localv = state->partial_block_localv;
         handlebars_value_ptr(&closure_localv[0], handlebars_ptr_ctor(CONTEXT, struct handlebars_module, vm->module, true));
-        handlebars_value_integer(&closure_localv[1], options.program);
+        handlebars_value_integer(&closure_localv[1], options->program);
         handlebars_value_integer(&closure_localv[2], LEN(vm->partialBlockStack));
-        handlebars_value_closure(partial_block, handlebars_closure_ctor(vm, invoke_partial_block_closure, closure_localc, closure_localv));
-        pushed_partial_block = true;
+        handlebars_value_array(
+            &closure_localv[3],
+            handlebars_stack_copy_ctor(vm->blockParamStack, HANDLEBARS_VM_STACK_SIZE)
+        );
+        if( handlebars_vm_lookup_data_map_str_find(
+                vm,
+                options->data,
+                HBS_STRL("partial-block"),
+                &closure_localv[4]
+            ) == NULL ) {
+            handlebars_value_null(&closure_localv[4]);
+        }
+        struct handlebars_closure * closure = handlebars_closure_ctor(
+            vm,
+            invoke_partial_block_closure,
+            closure_localc,
+            closure_localv
+        );
+        for( int i = 0; i < closure_localc; i++ ) {
+            handlebars_value_dtor(&closure_localv[i]);
+        }
+        handlebars_value_closure(partial_block, closure);
         PUSH(vm->partialBlockStack, partial_block);
-        HANDLEBARS_VALUE_ARRAY_UNDECL(closure_localv, closure_localc);
+        state->pushed_partial_block = true;
+
+        size_t partial_data_capacity = 2;
+        if( options->data->type == HANDLEBARS_VALUE_TYPE_MAP ) {
+            partial_data_capacity += handlebars_value_count(options->data);
+        }
+        handlebars_value_map(
+            &state->partial_data,
+            handlebars_map_ctor(CONTEXT, partial_data_capacity)
+        );
+        if( options->data->type == HANDLEBARS_VALUE_TYPE_MAP ) {
+            HANDLEBARS_VALUE_FOREACH_KV(options->data, key, child) {
+                state->partial_data.v.map = handlebars_map_update(
+                    state->partial_data.v.map,
+                    key,
+                    child
+                );
+            } HANDLEBARS_VALUE_FOREACH_END();
+        }
+        state->partial_data.v.map = handlebars_map_str_update(
+            state->partial_data.v.map,
+            HBS_STRL("_parent"),
+            options->data
+        );
+        state->partial_data.v.map = handlebars_map_str_update(
+            state->partial_data.v.map,
+            HBS_STRL("partial-block"),
+            partial_block
+        );
+        handlebars_vm_register_data_proxy(
+            vm,
+            state->partial_data.v.map,
+            options->data
+        );
+        options->data = &state->partial_data;
+    }
+
+    // Inline partial declarations in a partial-block body are decorators on
+    // the call itself. Install them before entering the selected partial even
+    // when that body is never invoked as @partial-block.
+    if( options->program >= 0 ) {
+        struct handlebars_module_table_entry * program_entry = &vm->module->programs[
+            options->program
+        ];
+        if( unlikely(program_entry->guid != (size_t) options->program
+                || program_entry->opcode_count == 0
+                || program_entry->opcode_offset > vm->module->opcode_count
+                || program_entry->opcode_count
+                    > vm->module->opcode_count - program_entry->opcode_offset) ) {
+            handlebars_throw(
+                CONTEXT,
+                HANDLEBARS_ERROR,
+                "Invalid opcode range for program: %ld",
+                options->program
+            );
+        }
+        handlebars_vm_install_inline_partials(vm, program_entry, true);
     }
 
     // Merge hashes
-    merge_hash(HBSCTX(vm), &argv[0], options.hash);
+    merge_hash(HBSCTX(vm), &argv[0], options->hash);
 
     if (!partial) {
-        if (options.program >= 0) {
+        if (options->program >= 0) {
             partial = partial_block;
         } else if (vm->flags & handlebars_compiler_flag_compat) {
             goto done;
@@ -856,14 +2767,16 @@ ACCEPT_FUNCTION(invoke_partial)
     // Wrap partial string in a closure to execute_template
     if (partial->type == HANDLEBARS_VALUE_TYPE_STRING) {
         const int closure_localc = 2;
-        HANDLEBARS_VALUE_ARRAY_DECL(closure_localv, closure_localc);
+        struct handlebars_value * closure_localv = state->partial_string_localv;
         handlebars_value_str(&closure_localv[0], handlebars_value_get_string(partial));
         if (vm->flags & handlebars_compiler_flag_compat) {
             handlebars_value_str(&closure_localv[1], opcode->op3.data.string.string);
         }
         struct handlebars_closure * closure = handlebars_closure_ctor(vm, invoke_partial_string_closure, closure_localc, closure_localv);
+        for( int i = 0; i < closure_localc; i++ ) {
+            handlebars_value_dtor(&closure_localv[i]);
+        }
         handlebars_value_closure(partial, closure);
-        HANDLEBARS_VALUE_ARRAY_UNDECL(closure_localv, closure_localc);
     }
 
     // Throw if the partial is not callable
@@ -879,32 +2792,69 @@ ACCEPT_FUNCTION(invoke_partial)
 
     // Finally, call the partial
     do {
-        buffer = handlebars_value_expression(
+        state->buffer = handlebars_value_expression(
             CONTEXT,
-            handlebars_value_call(partial, argc, argv, &options, vm, rv),
+            handlebars_value_call(partial, argc, argv, options, vm, rv),
             false
         );
 
         if (vm->flags & handlebars_compiler_flag_compat) {
-            vm->buffer = handlebars_string_append_str(CONTEXT, vm->buffer, buffer);
+            vm->buffer = handlebars_string_append_str(
+                CONTEXT,
+                vm->buffer,
+                state->buffer
+            );
+            handlebars_string_delref(state->buffer);
         } else {
-            vm->buffer = handlebars_string_indent_append(HBSCTX(vm), vm->buffer, buffer, opcode->op3.data.string.string);
+            vm->buffer = handlebars_string_indent_append(
+                HBSCTX(vm),
+                vm->buffer,
+                state->buffer,
+                opcode->op3.data.string.string
+            );
         }
+        state->buffer = NULL;
     } while (0);
 
 done:
+    error->jmp = prev_jmp;
+    if( state->inline_scope_saved ) {
+        handlebars_stack_restore(vm->partialScopeStack, state->inline_scope_save);
+    }
+
     // Pop partial block
-    if (pushed_partial_block) {
+    if (state->pushed_partial_block) {
         HANDLEBARS_VALUE_DECL(closure_value);
         POP(vm->partialBlockStack, closure_value);
         HANDLEBARS_VALUE_UNDECL(closure_value);
     }
+    vm->data_proxy_count = state->data_proxy_count;
 
-    VM_TEARDOWN_OPTIONS(argc);
-    HANDLEBARS_VALUE_UNDECL(partial_block);
-    HANDLEBARS_VALUE_UNDECL(rv);
-    HANDLEBARS_VALUE_UNDECL(partial_rv);
-    HANDLEBARS_VALUE_UNDECL(tmp);
+    for( int i = 0; i < 5; i++ ) {
+        handlebars_value_dtor(&state->extra[i]);
+    }
+    for( int i = 0; i < 5; i++ ) {
+        handlebars_value_dtor(&state->partial_block_localv[i]);
+    }
+    for( int i = 0; i < 2; i++ ) {
+        handlebars_value_dtor(&state->partial_string_localv[i]);
+    }
+    handlebars_value_dtor(&state->argv[0]);
+    handlebars_options_deinit(&state->options);
+    handlebars_value_dtor(&state->partial_block);
+    handlebars_value_dtor(&state->partial_data);
+    handlebars_value_dtor(&state->rv);
+    handlebars_value_dtor(&state->partial_rv);
+    handlebars_value_dtor(&state->tmp);
+    if( state->buffer != NULL ) {
+        handlebars_string_delref(state->buffer);
+    }
+    handlebars_talloc_free(state);
+    vm->depth = previous_depth;
+
+    if( caught != HANDLEBARS_SUCCESS && prev_jmp != NULL ) {
+        handlebars_longjmp(HBSCTX(vm), prev_jmp, caught);
+    }
 }
 
 ACCEPT_FUNCTION(lookup_block_param)
@@ -947,10 +2897,11 @@ ACCEPT_FUNCTION(lookup_block_param)
         struct handlebars_value * tmp = v2;
         struct handlebars_value * tmp2;
         for( i = 1; i < arr_len; i++ ) {
-            tmp2 = handlebars_value_map_find(tmp, arr[i].string, rv);
+            tmp2 = handlebars_vm_lookup_property(vm, tmp, arr[i].string, rv);
             if( tmp2 ) {
                 tmp = tmp2;
             } else {
+                tmp = NULL;
                 break;
             }
         }
@@ -970,12 +2921,45 @@ done:
     HANDLEBARS_VALUE_UNDECL(empty_value);
 }
 
-ACCEPT_FUNCTION(lookup_data)
+struct handlebars_lookup_data_state {
+    struct handlebars_value rv;
+    struct handlebars_value data;
+    struct handlebars_value val;
+};
+
+static void handlebars_lookup_data_state_deinit(
+    struct handlebars_lookup_data_state * state
+)
 {
-    HANDLEBARS_VALUE_DECL(rv);
-    HANDLEBARS_VALUE_DECL(data);
-    HANDLEBARS_VALUE_DECL(val);
+    handlebars_value_dtor(&state->val);
+    handlebars_value_dtor(&state->data);
+    handlebars_value_dtor(&state->rv);
+}
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void accept_lookup_data_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_opcode * opcode,
+    struct handlebars_lookup_data_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile previous = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
     struct handlebars_value * tmp;
+    struct handlebars_operand_string * arr;
+    struct handlebars_operand_string * first;
+    bool is_strict;
+    bool require_terminal;
+    long depth;
+    size_t arr_len;
+    size_t i;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
 
     if( unlikely(opcode->op1.type != handlebars_operand_type_long
             || opcode->op2.type != handlebars_operand_type_array
@@ -985,71 +2969,99 @@ ACCEPT_FUNCTION(lookup_data)
         handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Invalid lookup_data operands");
     }
 
-    handlebars_value_value(data, &vm->data);
+    handlebars_value_value(&state->data, &vm->data);
 
-    bool is_strict = (vm->flags & handlebars_compiler_flag_strict) || (vm->flags & handlebars_compiler_flag_assume_objects);
-    bool require_terminal = (vm->flags & handlebars_compiler_flag_strict) && opcode->op3.data.boolval;
+    is_strict = (vm->flags & handlebars_compiler_flag_strict) || (vm->flags & handlebars_compiler_flag_assume_objects);
+    require_terminal = (vm->flags & handlebars_compiler_flag_strict) && opcode->op3.data.boolval;
+    depth = opcode->op1.data.longval;
+    arr_len = opcode->op2.data.array.count;
+    arr = opcode->op2.data.array.array;
+    first = arr;
 
-    long depth = opcode->op1.data.longval;
-    size_t arr_len = opcode->op2.data.array.count;
-    size_t i;
-    struct handlebars_operand_string * arr = opcode->op2.data.array.array;
-    struct handlebars_operand_string * first = arr;
-
-    if( depth && data ) {
-        while( data && depth-- ) {
-            tmp = handlebars_value_map_str_find(data, HBS_STRL("_parent"), rv);
+    if( depth ) {
+        while( state->data.type != HANDLEBARS_VALUE_TYPE_NULL && depth-- ) {
+            tmp = handlebars_value_map_str_find(
+                &state->data,
+                HBS_STRL("_parent"),
+                &state->rv
+            );
             if (tmp != NULL) {
-                handlebars_value_value(data, tmp);
+                handlebars_value_value(&state->data, tmp);
+            } else {
+                handlebars_value_null(&state->data);
+                break;
             }
         }
     }
 
-    if( data && (tmp = handlebars_value_map_find(data, first->string, rv)) ) {
-        handlebars_value_value(val, tmp);
-    } else if (hbs_str_eq_strl(first->string, HBS_STRL("root"))) {
-        handlebars_value_value(val, TOP(vm->contextStack));
-    } else if (hbs_str_eq_strl(first->string, HBS_STRL("partial-block"))) {
-        tmp = TOP(vm->partialBlockStack);
-        if( tmp == NULL ) {
-            goto done_and_null;
-        }
-        handlebars_value_value(val, tmp);
+    tmp = NULL;
+    if( state->data.type != HANDLEBARS_VALUE_TYPE_NULL ) {
+        tmp = handlebars_vm_lookup_data_property(
+            vm,
+            &state->data,
+            first->string,
+            &state->rv
+        );
+    }
+
+    if( tmp != NULL ) {
+        handlebars_value_value(&state->val, tmp);
     } else if( vm->flags & handlebars_compiler_flag_assume_objects ) {
         goto done_and_err;
     } else {
+        handlebars_value_null(&state->val);
+        if( require_terminal ) {
+            goto done_and_err;
+        }
         goto done_and_null;
     }
 
     for( i = 1 ; i < arr_len; i++ ) {
         struct handlebars_operand_string * part = arr + i;
-        if( handlebars_value_get_type(val) == HANDLEBARS_VALUE_TYPE_MAP &&
-                NULL != (tmp = handlebars_value_map_find(val, part->string, rv)) ) {
-            handlebars_value_value(val, tmp);
+        if( NULL != (tmp = handlebars_vm_lookup_property(
+                vm,
+                &state->val,
+                part->string,
+                &state->rv
+            )) ) {
+            handlebars_value_value(&state->val, tmp);
         } else if( is_strict || require_terminal ) {
             goto done_and_err;
+        } else {
+            handlebars_value_null(&state->val);
+            break;
         }
     }
 
-    if( val->type == HANDLEBARS_VALUE_TYPE_NULL ) {
-        done_and_null:
-        if( require_terminal ) {
-            done_and_err:
-            handlebars_throw_ex(
-                CONTEXT,
-                HANDLEBARS_ERROR,
-                &opcode->loc,
-                "\"%.*s\" not defined in object",
-                (int) hbs_str_len(arr->string), hbs_str_val(arr->string)
-            );
-        }
+done_and_null:
+    PUSH(vm->stack, &state->val);
+    goto done;
+
+done_and_err:
+    handlebars_throw_ex(
+        CONTEXT,
+        HANDLEBARS_ERROR,
+        &opcode->loc,
+        "\"%.*s\" not defined in object",
+        (int) hbs_str_len(arr->string), hbs_str_val(arr->string)
+    );
+
+done:
+    error->jmp = previous;
+    handlebars_lookup_data_state_deinit(state);
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, previous, caught);
     }
+}
 
-    PUSH(vm->stack, val);
+ACCEPT_NOINLINE_FUNCTION(lookup_data)
+{
+    struct handlebars_lookup_data_state state;
 
-    HANDLEBARS_VALUE_UNDECL(val);
-    HANDLEBARS_VALUE_UNDECL(data);
-    HANDLEBARS_VALUE_UNDECL(rv);
+    handlebars_value_init(&state.rv);
+    handlebars_value_init(&state.data);
+    handlebars_value_init(&state.val);
+    accept_lookup_data_guarded(vm, opcode, &state);
 }
 
 ACCEPT_FUNCTION(lookup_on_context)
@@ -1071,7 +3083,6 @@ ACCEPT_FUNCTION(lookup_on_context)
     size_t arr_len = opcode->op1.data.array.count;
     struct handlebars_operand_string * arr = opcode->op1.data.array.array;
     struct handlebars_operand_string * arr_end = arr + arr_len;
-    long index = -1;
     bool is_strict = (vm->flags & handlebars_compiler_flag_strict) || (vm->flags & handlebars_compiler_flag_assume_objects);
     bool require_terminal = (vm->flags & handlebars_compiler_flag_strict) && opcode->op3.data.boolval;
 
@@ -1085,20 +3096,24 @@ ACCEPT_FUNCTION(lookup_on_context)
 
     do {
         bool is_last = arr == arr_end - 1;
-        if( handlebars_value_get_type(value) == HANDLEBARS_VALUE_TYPE_MAP ) {
-            value = handlebars_value_map_find(value, arr->string, rv2);
-        } else if( handlebars_value_get_type(value) == HANDLEBARS_VALUE_TYPE_ARRAY ) {
-            if (sscanf(hbs_str_val(arr->string), "%ld", &index)) {
-                value = handlebars_value_array_find(value, index, rv2);
-            } else {
-                value = NULL;
-            }
+        enum handlebars_value_type type = handlebars_value_get_type(value);
+
+        if( type == HANDLEBARS_VALUE_TYPE_MAP
+                || type == HANDLEBARS_VALUE_TYPE_ARRAY
+                || type == HANDLEBARS_VALUE_TYPE_STRING ) {
+            value = handlebars_vm_lookup_property(vm, value, arr->string, rv2);
         } else if( vm->flags & handlebars_compiler_flag_assume_objects && is_last ) {
             goto done_and_err;
         } else {
             goto done_and_null;
         }
         if( !value ) {
+            if( type == HANDLEBARS_VALUE_TYPE_STRING ) {
+                if( (vm->flags & handlebars_compiler_flag_assume_objects) && is_last ) {
+                    goto done_and_err;
+                }
+                goto done_and_null;
+            }
             if( is_strict && !is_last ) {
                 goto done_and_err;
             }
@@ -1188,6 +3203,9 @@ ACCEPT_FUNCTION(push_literal)
             break;
         case handlebars_operand_type_long:
             handlebars_value_integer(value, opcode->op1.data.longval);
+            break;
+        case handlebars_operand_type_double:
+            handlebars_value_float(value, opcode->op1.data.doubleval);
             break;
         case handlebars_operand_type_null:
             break;
@@ -1316,27 +3334,54 @@ static void handlebars_vm_accept(struct handlebars_vm * vm, struct handlebars_mo
     END_ACCEPT
 }
 
-struct handlebars_string * handlebars_vm_execute_program_ex(
+struct handlebars_vm_program_call_state {
+    struct handlebars_value previous_data;
+    struct handlebars_string * result;
+    struct handlebars_vm_call_checkpoint checkpoint;
+};
+
+static void handlebars_vm_program_call_state_deinit(
+    struct handlebars_vm_program_call_state * state
+)
+{
+    handlebars_value_dtor(&state->previous_data);
+}
+
+HBS_ATTR_NOINLINE
+static void handlebars_vm_execute_program_inner(
     struct handlebars_vm * vm,
     long program_num,
     struct handlebars_value * context,
     struct handlebars_value * data,
-    struct handlebars_value * block_params
+    struct handlebars_value * block_params,
+    struct handlebars_vm_program_call_state * state
 ) {
     if( program_num < 0 ) {
-        return handlebars_string_init(CONTEXT, 0);
+        state->result = handlebars_string_init(CONTEXT, 0);
+        return;
     } else if( unlikely(program_num >= (long) vm->module->program_count) ) {
         handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Invalid program: %ld", program_num);
     }
 
     // Get program
-	struct handlebars_module_table_entry * entry = &vm->module->programs[program_num];
+    struct handlebars_module_table_entry entry_copy = vm->module->programs[program_num];
+    struct handlebars_module_table_entry * entry = &entry_copy;
     if( unlikely(entry->guid != (size_t) program_num
             || entry->opcode_count == 0
             || entry->opcode_offset > vm->module->opcode_count
             || entry->opcode_count > vm->module->opcode_count - entry->opcode_offset) ) {
         handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Invalid opcode range for program: %ld", program_num);
     }
+    if( unlikely(vm->depth >= HANDLEBARS_VM_MAX_DEPTH) ) {
+        handlebars_throw(
+            CONTEXT,
+            HANDLEBARS_STACK_OVERFLOW,
+            "VM program stack overflow at depth %ld",
+            vm->depth
+        );
+    }
+    vm->depth++;
+    HANDLEBARS_VALUE_DECL(empty_block_params);
 
     // Save and set buffer
     struct handlebars_string * prev_buffer = vm->buffer;
@@ -1348,6 +3393,7 @@ struct handlebars_string * handlebars_vm_execute_program_ex(
     assert(vm->hashStack != NULL);
     assert(vm->blockParamStack != NULL);
     assert(vm->partialBlockStack != NULL);
+    assert(vm->partialScopeStack != NULL);
 
     // Save stacks
     struct handlebars_stack_save_buf st = handlebars_stack_save(vm->stack);
@@ -1355,6 +3401,7 @@ struct handlebars_string * handlebars_vm_execute_program_ex(
     struct handlebars_stack_save_buf cst = handlebars_stack_save(vm->contextStack);
     struct handlebars_stack_save_buf bst = handlebars_stack_save(vm->blockParamStack);
     struct handlebars_stack_save_buf pst = handlebars_stack_save(vm->partialBlockStack);
+    struct handlebars_stack_save_buf ist = handlebars_stack_save(vm->partialScopeStack);
 
     // Push the context stack
     // if (LEN(vm->contextStack) <= 0 || TOP(vm->contextStack) != context) {
@@ -1363,16 +3410,23 @@ struct handlebars_string * handlebars_vm_execute_program_ex(
     }
 
     // Save and set data
-    HANDLEBARS_VALUE_DECL(prev_data);
     if( data ) {
-        handlebars_value_value(prev_data, &vm->data);
+        handlebars_value_value(&state->previous_data, &vm->data);
         handlebars_value_value(&vm->data, data);
     }
 
     // Set block params
-    if( block_params ) {
-        PUSH(vm->blockParamStack, block_params);
+    if( block_params || program_num != 0 ) {
+        PUSH(vm->blockParamStack, block_params ? block_params : empty_block_params);
     }
+
+    size_t inline_opcode_count = handlebars_vm_install_inline_partials(
+        vm,
+        entry,
+        false
+    );
+    entry->opcode_offset += inline_opcode_count;
+    entry->opcode_count -= inline_opcode_count;
 
     // Execute the program
 	handlebars_vm_accept(vm, entry);
@@ -1383,6 +3437,7 @@ struct handlebars_string * handlebars_vm_execute_program_ex(
     handlebars_stack_restore(vm->contextStack, cst);
     handlebars_stack_restore(vm->blockParamStack, bst);
     handlebars_stack_restore(vm->partialBlockStack, pst);
+    handlebars_stack_restore(vm->partialScopeStack, ist);
 
     // Clear last context
     if (vm->last_context) {
@@ -1391,15 +3446,79 @@ struct handlebars_string * handlebars_vm_execute_program_ex(
 
     // Restore data
     if (data) {
-        handlebars_value_value(&vm->data, prev_data);
+        handlebars_value_value(&vm->data, &state->previous_data);
     }
-    HANDLEBARS_VALUE_UNDECL(prev_data);
 
     // Restore buffer
     struct handlebars_string * buffer = vm->buffer;
     vm->buffer = prev_buffer;
 
-    return buffer;
+    HANDLEBARS_VALUE_UNDECL(empty_block_params);
+    vm->depth--;
+
+    state->result = buffer;
+}
+
+HBS_ATTR_NOINLINE
+static void handlebars_vm_execute_program_guarded(
+    struct handlebars_vm * vm,
+    long program_num,
+    struct handlebars_value * context,
+    struct handlebars_value * data,
+    struct handlebars_value * block_params,
+    struct handlebars_vm_program_call_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile previous = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+    } else {
+        handlebars_vm_call_checkpoint_begin(vm, &state->checkpoint);
+        handlebars_vm_execute_program_inner(
+            vm,
+            program_num,
+            context,
+            data,
+            block_params,
+            state
+        );
+    }
+
+    error->jmp = previous;
+    handlebars_vm_call_checkpoint_finish(vm, &state->checkpoint, caught);
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_program_call_state_deinit(state);
+        handlebars_vm_rethrow_caught(vm, previous, caught);
+    }
+}
+
+struct handlebars_string * handlebars_vm_execute_program_ex(
+    struct handlebars_vm * vm,
+    long program_num,
+    struct handlebars_value * context,
+    struct handlebars_value * data,
+    struct handlebars_value * block_params
+)
+{
+    struct handlebars_vm_program_call_state state = {0};
+    struct handlebars_string * result;
+
+    handlebars_value_init(&state.previous_data);
+    handlebars_vm_execute_program_guarded(
+        vm,
+        program_num,
+        context,
+        data,
+        block_params,
+        &state
+    );
+    result = state.result;
+    handlebars_vm_program_call_state_deinit(&state);
+    return result;
 }
 
 struct handlebars_string * handlebars_vm_execute_program(struct handlebars_vm * vm, long program, struct handlebars_value * context)
@@ -1407,13 +3526,143 @@ struct handlebars_string * handlebars_vm_execute_program(struct handlebars_vm * 
     return handlebars_vm_execute_program_ex(vm, program, context, NULL, NULL);
 }
 
-struct handlebars_string * handlebars_vm_execute_ex(
+struct handlebars_vm_initial_data_state {
+    struct handlebars_value frame;
+    struct handlebars_value lookup;
+    struct handlebars_value parent;
+    size_t capacity;
+    bool has_root;
+};
+
+static void handlebars_vm_initial_data_state_deinit(
+    struct handlebars_vm_initial_data_state * state
+)
+{
+    handlebars_value_dtor(&state->parent);
+    handlebars_value_dtor(&state->lookup);
+    handlebars_value_dtor(&state->frame);
+}
+
+HBS_ATTR_NOINLINE HBS_ATTR_NONNULL_ALL
+static void handlebars_vm_initialize_data_guarded(
+    struct handlebars_vm * vm,
+    struct handlebars_value * context,
+    struct handlebars_value * source,
+    struct handlebars_vm_initial_data_state * state
+)
+{
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile previous = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_value * root;
+    struct handlebars_value * parent;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
+
+    root = NULL;
+    if( handlebars_value_get_type(source) == HANDLEBARS_VALUE_TYPE_MAP ) {
+        root = handlebars_value_map_str_find(
+            source,
+            HBS_STRL("root"),
+            &state->lookup
+        );
+    }
+    state->has_root = root != NULL;
+    if( root != NULL && root != &state->lookup ) {
+        handlebars_value_value(&state->lookup, root);
+    }
+    if( state->has_root && source->type != HANDLEBARS_VALUE_TYPE_USER ) {
+        handlebars_value_value(&vm->data, source);
+        goto done;
+    }
+
+    if( source->type == HANDLEBARS_VALUE_TYPE_MAP ) {
+        state->capacity += handlebars_value_count(source);
+    }
+    handlebars_value_map(
+        &state->frame,
+        handlebars_map_ctor(CONTEXT, state->capacity)
+    );
+
+    if( source->type == HANDLEBARS_VALUE_TYPE_MAP ) {
+        HANDLEBARS_VALUE_FOREACH_KV(source, key, child) {
+            state->frame.v.map = handlebars_map_update(
+                state->frame.v.map,
+                key,
+                child
+            );
+        } HANDLEBARS_VALUE_FOREACH_END();
+    }
+    parent = NULL;
+    if( state->has_root && source->type == HANDLEBARS_VALUE_TYPE_USER ) {
+        parent = handlebars_value_map_str_find(
+            source,
+            HBS_STRL("_parent"),
+            &state->parent
+        );
+        if( parent != NULL && parent != &state->parent ) {
+            handlebars_value_value(&state->parent, parent);
+        }
+    }
+    if( !state->has_root
+            && handlebars_value_get_type(source) == HANDLEBARS_VALUE_TYPE_MAP ) {
+        state->frame.v.map = handlebars_map_str_update(
+            state->frame.v.map,
+            HBS_STRL("_parent"),
+            source
+        );
+    } else if( parent != NULL ) {
+        state->frame.v.map = handlebars_map_str_update(
+            state->frame.v.map,
+            HBS_STRL("_parent"),
+            &state->parent
+        );
+    }
+    state->frame.v.map = handlebars_map_str_update(
+        state->frame.v.map,
+        HBS_STRL("root"),
+        state->has_root ? &state->lookup : context
+    );
+    handlebars_value_value(&vm->data, &state->frame);
+    if( source->type == HANDLEBARS_VALUE_TYPE_USER ) {
+        handlebars_vm_register_data_proxy(vm, vm->data.v.map, source);
+    }
+
+done:
+    error->jmp = previous;
+    handlebars_vm_initial_data_state_deinit(state);
+    if( caught != HANDLEBARS_SUCCESS ) {
+        handlebars_vm_rethrow_caught(vm, previous, caught);
+    }
+}
+
+static void handlebars_vm_initialize_data(
+    struct handlebars_vm * vm,
+    struct handlebars_value * context,
+    struct handlebars_value * source
+)
+{
+    struct handlebars_vm_initial_data_state state = {0};
+
+    handlebars_value_init(&state.frame);
+    handlebars_value_init(&state.lookup);
+    handlebars_value_init(&state.parent);
+    state.capacity = 2;
+    handlebars_vm_initialize_data_guarded(vm, context, source, &state);
+}
+
+static struct handlebars_string * handlebars_vm_execute_ex_internal(
     struct handlebars_vm * vm,
     struct handlebars_module * module,
     struct handlebars_value * context,
     long program,
     struct handlebars_value * data,
-    struct handlebars_value * block_params
+    struct handlebars_value * block_params,
+    bool initialize_data
 ) {
     struct handlebars_error * error = HBSCTX(vm)->e;
     jmp_buf * volatile prev = error->jmp;
@@ -1430,16 +3679,25 @@ struct handlebars_string * handlebars_vm_execute_ex(
     struct handlebars_stack_save_buf cst;
     struct handlebars_stack_save_buf bst;
     struct handlebars_stack_save_buf pst;
+    struct handlebars_stack_save_buf ist;
     HANDLEBARS_VALUE_DECL(prev_data);
+    HANDLEBARS_VALUE_DECL(prev_render_data);
     HANDLEBARS_VALUE_DECL(prev_last_context_value);
 
     struct handlebars_string * volatile buffer = NULL;
     enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    struct handlebars_vm_error_snapshot previous_error;
     bool volatile setup_last_context = false;
     bool volatile setup_stacks = false;
+    bool previous_render_data_active = vm->render_data_active;
+    struct handlebars_vm_data_proxy * previous_data_proxies = vm->data_proxies;
+    size_t previous_data_proxy_count = vm->data_proxy_count;
+    struct handlebars_vm_data_proxy * data_proxies;
+    struct handlebars_vm_data_proxy * volatile data_proxy_snapshot = NULL;
     jmp_buf buf;
 
     handlebars_value_value(prev_data, &vm->data);
+    handlebars_value_value(prev_render_data, &vm->render_data);
     if( prev_delim_open != NULL ) {
         handlebars_string_addref(prev_delim_open);
     }
@@ -1453,12 +3711,40 @@ struct handlebars_string * handlebars_vm_execute_ex(
     // Allocate alloca-backed state before setjmp so it remains valid while
     // cleaning up after a longjmp from a helper or closure.
     if (vm->stack == NULL) {
-        vm->stack = handlebars_stack_alloca(HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
-        vm->contextStack = handlebars_stack_alloca(HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
-        vm->hashStack = handlebars_stack_alloca(HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
-        vm->blockParamStack = handlebars_stack_alloca(HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
-        vm->partialBlockStack = handlebars_stack_alloca(HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
+        handlebars_stack_alloca(vm->stack, HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
+        handlebars_stack_alloca(vm->contextStack, HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
+        handlebars_stack_alloca(vm->hashStack, HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
+        handlebars_stack_alloca(vm->blockParamStack, HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
+        handlebars_stack_alloca(vm->partialBlockStack, HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
+        handlebars_stack_alloca(vm->partialScopeStack, HBSCTX(vm), HANDLEBARS_VM_STACK_SIZE);
         setup_stacks = true;
+    }
+    if( initialize_data || vm->data_proxies == NULL ) {
+        data_proxies = alloca(
+            sizeof(*vm->data_proxies) * HANDLEBARS_VM_MAX_DEPTH
+        );
+        if( initialize_data
+                && previous_data_proxies != NULL
+                && previous_data_proxy_count > 0 ) {
+            memcpy(
+                data_proxies,
+                previous_data_proxies,
+                sizeof(*data_proxies) * previous_data_proxy_count
+            );
+            vm->data_proxy_count = previous_data_proxy_count;
+        } else {
+            vm->data_proxy_count = 0;
+        }
+        vm->data_proxies = data_proxies;
+    } else if( previous_data_proxy_count > 0 ) {
+        data_proxy_snapshot = alloca(
+            sizeof(*data_proxy_snapshot) * previous_data_proxy_count
+        );
+        memcpy(
+            data_proxy_snapshot,
+            previous_data_proxies,
+            sizeof(*data_proxy_snapshot) * previous_data_proxy_count
+        );
     }
 
     st = handlebars_stack_save(vm->stack);
@@ -1466,6 +3752,7 @@ struct handlebars_string * handlebars_vm_execute_ex(
     cst = handlebars_stack_save(vm->contextStack);
     bst = handlebars_stack_save(vm->blockParamStack);
     pst = handlebars_stack_save(vm->partialBlockStack);
+    ist = handlebars_stack_save(vm->partialScopeStack);
 
     if (vm->last_context == NULL) {
         vm->last_context = alloca(HANDLEBARS_VALUE_SIZE);
@@ -1473,6 +3760,11 @@ struct handlebars_string * handlebars_vm_execute_ex(
         setup_last_context = true;
     } else {
         handlebars_value_value(prev_last_context_value, vm->last_context);
+    }
+
+    memset(&previous_error, 0, sizeof(previous_error));
+    if( setup_stacks ) {
+        handlebars_vm_error_snapshot_begin(vm, &previous_error);
     }
 
     // Always install a local boundary. Callers may catch the rethrown error,
@@ -1487,7 +3779,34 @@ struct handlebars_string * handlebars_vm_execute_ex(
     vm->flags |= module->flags;
 
     // Execute
-    buffer = handlebars_vm_execute_program_ex(vm, program, context, data, block_params);
+    if( initialize_data ) {
+        if( data != NULL ) {
+            handlebars_value_value(&vm->render_data, data);
+        } else if( !vm->render_data_active ) {
+            handlebars_value_value(&vm->render_data, &vm->data);
+        }
+        vm->render_data_active = true;
+        handlebars_vm_initialize_data(
+            vm,
+            context,
+            &vm->render_data
+        );
+        buffer = handlebars_vm_execute_program_ex(
+            vm,
+            program,
+            context,
+            NULL,
+            block_params
+        );
+    } else {
+        buffer = handlebars_vm_execute_program_ex(
+            vm,
+            program,
+            context,
+            data,
+            block_params
+        );
+    }
 
 done:
     error->jmp = prev;
@@ -1497,6 +3816,7 @@ done:
     handlebars_stack_restore(vm->contextStack, cst);
     handlebars_stack_restore(vm->blockParamStack, bst);
     handlebars_stack_restore(vm->partialBlockStack, pst);
+    handlebars_stack_restore(vm->partialScopeStack, ist);
 
     if( vm->buffer != prev_buffer ) {
         if( vm->buffer != NULL ) {
@@ -1506,6 +3826,17 @@ done:
     }
 
     handlebars_value_value(&vm->data, prev_data);
+    handlebars_value_value(&vm->render_data, prev_render_data);
+    if( data_proxy_snapshot != NULL ) {
+        memcpy(
+            previous_data_proxies,
+            data_proxy_snapshot,
+            sizeof(*data_proxy_snapshot) * previous_data_proxy_count
+        );
+    }
+    vm->data_proxies = previous_data_proxies;
+    vm->data_proxy_count = previous_data_proxy_count;
+    vm->render_data_active = previous_render_data_active;
 
     if( setup_last_context ) {
         handlebars_value_dtor(vm->last_context);
@@ -1533,6 +3864,7 @@ done:
         vm->hashStack = NULL;
         vm->blockParamStack = NULL;
         vm->partialBlockStack = NULL;
+        vm->partialScopeStack = NULL;
     }
 
     // Reset
@@ -1541,14 +3873,39 @@ done:
     vm->flags = prev_flags;
     vm->depth = prev_depth;
 
+    if( setup_stacks ) {
+        handlebars_vm_execution_error_snapshot_finish(vm, &previous_error);
+    }
+
     HANDLEBARS_VALUE_UNDECL(prev_last_context_value);
+    HANDLEBARS_VALUE_UNDECL(prev_render_data);
     HANDLEBARS_VALUE_UNDECL(prev_data);
 
     if( caught != HANDLEBARS_SUCCESS && prev != NULL ) {
-        longjmp(*prev, caught);
+        handlebars_longjmp(HBSCTX(vm), prev, caught);
     }
 
     return (struct handlebars_string *) buffer;
+}
+
+struct handlebars_string * handlebars_vm_execute_ex(
+    struct handlebars_vm * vm,
+    struct handlebars_module * module,
+    struct handlebars_value * context,
+    long program,
+    struct handlebars_value * data,
+    struct handlebars_value * block_params
+)
+{
+    return handlebars_vm_execute_ex_internal(
+        vm,
+        module,
+        context,
+        program,
+        data,
+        block_params,
+        true
+    );
 }
 
 struct handlebars_string * handlebars_vm_execute(
@@ -1557,4 +3914,68 @@ struct handlebars_string * handlebars_vm_execute(
     struct handlebars_value * context
 ) {
     return handlebars_vm_execute_ex(vm, module, context, 0, NULL, NULL);
+}
+
+enum handlebars_error_type handlebars_vm_execute_try_ex(
+    struct handlebars_vm * vm,
+    struct handlebars_module * module,
+    struct handlebars_value * context,
+    long program,
+    struct handlebars_value * data,
+    struct handlebars_value * block_params,
+    struct handlebars_string ** result
+) {
+    struct handlebars_error * error = HBSCTX(vm)->e;
+    jmp_buf * volatile previous = error->jmp;
+    struct handlebars_string * volatile output = NULL;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    jmp_buf buf;
+
+    *result = NULL;
+    handlebars_error_clear(HBSCTX(vm));
+
+    if( handlebars_setjmp_ex(vm, &buf) ) {
+        caught = error->num;
+        goto done;
+    }
+
+    output = handlebars_vm_execute_ex(
+        vm,
+        module,
+        context,
+        program,
+        data,
+        block_params
+    );
+
+done:
+    error->jmp = previous;
+    if( caught == HANDLEBARS_SUCCESS && error->num != HANDLEBARS_SUCCESS ) {
+        caught = error->num;
+        if( output != NULL ) {
+            handlebars_string_delref((struct handlebars_string *) output);
+            output = NULL;
+        }
+    }
+    if( caught == HANDLEBARS_SUCCESS ) {
+        *result = (struct handlebars_string *) output;
+    }
+    return caught;
+}
+
+enum handlebars_error_type handlebars_vm_execute_try(
+    struct handlebars_vm * vm,
+    struct handlebars_module * module,
+    struct handlebars_value * context,
+    struct handlebars_string ** result
+) {
+    return handlebars_vm_execute_try_ex(
+        vm,
+        module,
+        context,
+        0,
+        NULL,
+        NULL,
+        result
+    );
 }

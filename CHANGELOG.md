@@ -4,6 +4,73 @@ All Notable changes to `handlebars.c` will be documented in this file.
 
 Updates should follow the [Keep a CHANGELOG](http://keepachangelog.com/) principles.
 
+## [Unreleased]
+
+### Added
+- Core construction, parsing, compilation, serialization, and rendering now
+  have `_try` entry points that return errors without allowing the library's
+  internal `longjmp` handling to escape the call.
+- Optional JSON and YAML conversions now have transactional `_try` entry points
+  that preserve the destination value on failure.
+- Cache constructors and operations now have `_try` entry points that report
+  errors without allowing library `longjmp` handling to escape the call.
+- Filesystem partial-loader construction and lookup now have transactional
+  `_try` entry points that preserve caller-owned output values on failure.
+- `handlebarsc` can register bounded plain-text or structured-JSON helpers
+  backed by external executables.
+- String and array values expose an emulated `length` property during template
+  lookup.
+- Native array/map mutations and typed-pointer retrieval now have checked entry
+  points for callers that need recoverable type and operation failures.
+- Maps now have a closeable iterator API that keeps their backing vector stable
+  and participates in library error unwinding.
+
+### Changed
+- Documented the talloc and reference-count lifetime model, including uniform
+  cleanup for value conversions and VM render results.
+- Documented VM setter ownership and made passing NULL to the cache setter an
+  explicit way to disable caching.
+- Documented that every cache hit must be paired with a cache release, along
+  with the mmap backend's existing reset behavior while hits remain active.
+- Value iterators now retain their backing storage, support nested map
+  iteration, and are closed when an error unwinds through the library.
+- The legacy map foreach macro now uses the closeable map iterator, so library
+  error unwinds and, on supported compilers, early lexical exits no longer
+  leave the map locked against rehashing. Its existing in-place mutation
+  behavior is preserved for shared maps; mutation is rejected only when a
+  value-iterator snapshot of the same map is simultaneously active.
+- Value iterators must now be declared with
+  `HANDLEBARS_VALUE_ITERATOR_DECL` and initialized with
+  `HANDLEBARS_VALUE_ITERATOR_INIT`; the unsafe public initializer that assumed
+  hidden trailing storage was removed.
+- `hbs_str_val()` now returns a read-only byte buffer. Callers that modified
+  string storage directly must use the public string mutation APIs so
+  copy-on-write state and cached hashes remain valid. String trimming now
+  invalidates cached hashes whenever it changes the string.
+- The public value iterator layout and initialization contract changed, and the
+  shared-library ABI is now version 10. Downstream binaries must be rebuilt.
+- Serialized programs now retain block-parameter counts, extending the public
+  module-table and `handlebars_options` layouts.
+- VM rendering now transfers filesystem partial-loader errors from the loader
+  context to the VM context.
+
+### Fixed
+- Stable installed headers now compile independently as C and C++; generated
+  Flex/Bison headers remain unchanged.
+- JSON `null` elements no longer reuse the preceding iterator value.
+- Recursive value conversion, expression rendering, and diagnostic dumping now
+  reject cyclic and excessively deep container graphs.
+- Block parameters preserve lexical precedence through nested helpers and
+  partial blocks.
+- Subexpressions reject truthy context values that are not callable.
+- LMDB cache statistics report the correct backend name.
+- Failed map copy-on-write mutations now release unpublished replacement maps
+  and temporary string keys while preserving the original map.
+- Cached runtime templates are released through the cache that produced them
+  when a helper changes the VM's cache during rendering.
+- Runtime-template cache errors now remain inside VM `_try` boundaries when
+  the borrowed cache has an independent error context.
+
 ## [1.0.0]
 
 ### Changed

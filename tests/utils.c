@@ -22,12 +22,14 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
-#include <pcre.h>
+#include <pcre2.h>
 #include <talloc.h>
 
 #include <errno.h>
 #include <dirent.h>
+#include <locale.h>
 #ifndef YY_NO_UNISTD_H
 #include <unistd.h>
 #endif
@@ -66,6 +68,37 @@ struct handlebars_vm * vm;
 size_t init_blocks;
 static size_t root_blocks;
 static size_t null_blocks;
+
+void clear_intentional_error(void)
+{
+    handlebars_error_clear(context);
+}
+
+char * activate_comma_decimal_locale(void)
+{
+    const char * current_locale = setlocale(LC_NUMERIC, NULL);
+    char * saved_locale;
+
+    ck_assert_ptr_nonnull(current_locale);
+    saved_locale = handlebars_talloc_strdup(context, current_locale);
+    ck_assert_ptr_nonnull(saved_locale);
+
+    /* Musl accepts locale names while retaining the C numeric convention. */
+    if( setlocale(LC_NUMERIC, "de_DE.UTF-8") == NULL
+            || strcmp(localeconv()->decimal_point, ",") != 0 ) {
+        ck_assert_ptr_nonnull(setlocale(LC_NUMERIC, saved_locale));
+        handlebars_talloc_free(saved_locale);
+        return NULL;
+    }
+    return saved_locale;
+}
+
+void restore_numeric_locale(char * saved_locale)
+{
+    ck_assert_ptr_nonnull(saved_locale);
+    ck_assert_ptr_nonnull(setlocale(LC_NUMERIC, saved_locale));
+    handlebars_talloc_free(saved_locale);
+}
 
 void default_setup(void)
 {
@@ -187,39 +220,59 @@ int scan_directory_callback(char * dirname, scan_directory_cb cb)
 
 int regex_compare(const char * regex, const char * string, char ** error)
 {
-    pcre * re;
-    const char * errmsg = NULL;
-    int erroffset;
-    int ovector[30];
+    pcre2_code *re;
+    int errorcode = 0;
+    PCRE2_UCHAR errmsg[128];
+    PCRE2_SIZE erroffset;
+    pcre2_match_data *match_data;
     int rc, ret;
 
-    re = pcre_compile(regex, 0, &errmsg, &erroffset, NULL);
+    re = pcre2_compile((PCRE2_SPTR)regex, PCRE2_ZERO_TERMINATED, 0, &errorcode, &erroffset, NULL);
 
-    if( !re ) {
-        *error = talloc_asprintf(NULL, "Regex '%s' compilation failed at offset %d: %s\n", regex, erroffset, errmsg);
+    if (!re) {
+        if( pcre2_get_error_message(errorcode, errmsg, sizeof(errmsg)) < 0 ) {
+            snprintf((char *) errmsg, sizeof(errmsg), "PCRE2 error %d", errorcode);
+        }
+        *error = talloc_asprintf(
+            NULL,
+            "Regex '%s' compilation failed at offset %zu: %s",
+            regex,
+            erroffset,
+            (const char *) errmsg
+        );
         return 1;
-    } else if( errmsg ) {
-        *error = talloc_strdup(NULL, errmsg);
-        ret = 2;
-        goto error;
     }
 
-    rc = pcre_exec(re, NULL, string, (int) strlen(string), 0, 0, ovector, 30);
-    if( rc <= 0 ) {
+    match_data = pcre2_match_data_create_from_pattern(re, NULL);
+    if( !match_data ) {
+        *error = talloc_strdup(NULL, "Failed to allocate PCRE2 match data");
+        pcre2_code_free(re);
+        return 1;
+    }
+
+    rc = pcre2_match(re, (PCRE2_SPTR)string, (PCRE2_SIZE)strlen(string), 0, 0, match_data, NULL);
+    if( rc == PCRE2_ERROR_NOMATCH ) {
         ret = 2;
         *error = talloc_asprintf(NULL, "Regex '%s' didn't match string '%s'", regex, string);
+    } else if( rc < 0 ) {
+        if( pcre2_get_error_message(rc, errmsg, sizeof(errmsg)) < 0 ) {
+            snprintf((char *) errmsg, sizeof(errmsg), "PCRE2 error %d", rc);
+        }
+        ret = 2;
+        *error = talloc_asprintf(NULL, "Regex '%s' match failed: %s", regex, (const char *) errmsg);
     } else {
         ret = 0;
     }
 
-error:
-    pcre_free(re);
+    pcre2_match_data_free(match_data);
+    pcre2_code_free(re);
+
     return ret;
 }
 
 char * normalize_template_whitespace(TALLOC_CTX *ctx, struct handlebars_string * str)
 {
-    char *i = hbs_str_val(str);
+    const char *i = hbs_str_val(str);
     char *ret = handlebars_talloc_size(context, hbs_str_len(str) + 1);
     char *j = ret;
     while (1) {
@@ -256,6 +309,115 @@ char * normalize_template_whitespace(TALLOC_CTX *ctx, struct handlebars_string *
 }
 
 #ifdef HANDLEBARS_HAVE_JSON
+static int hbs_test_json_has_valid_whitespace(
+    const char * data,
+    size_t length
+)
+{
+    enum {
+        HBS_TEST_JSON_NORMAL,
+        HBS_TEST_JSON_STRING,
+        HBS_TEST_JSON_STRING_ESCAPE,
+        HBS_TEST_JSON_LINE_COMMENT,
+        HBS_TEST_JSON_BLOCK_COMMENT
+    } state = HBS_TEST_JSON_NORMAL;
+    char string_delimiter = '\0';
+    size_t i;
+
+    for( i = 0; i < length; i++ ) {
+        char byte = data[i];
+
+        switch( state ) {
+            case HBS_TEST_JSON_STRING:
+                if( byte == '\\' ) {
+                    state = HBS_TEST_JSON_STRING_ESCAPE;
+                } else if( byte == string_delimiter ) {
+                    state = HBS_TEST_JSON_NORMAL;
+                }
+                break;
+
+            case HBS_TEST_JSON_STRING_ESCAPE:
+                state = HBS_TEST_JSON_STRING;
+                break;
+
+            case HBS_TEST_JSON_LINE_COMMENT:
+                if( byte == '\n' ) {
+                    state = HBS_TEST_JSON_NORMAL;
+                }
+                break;
+
+            case HBS_TEST_JSON_BLOCK_COMMENT:
+                if( byte == '*' && i + 1 < length && data[i + 1] == '/' ) {
+                    state = HBS_TEST_JSON_NORMAL;
+                    i++;
+                }
+                break;
+
+            case HBS_TEST_JSON_NORMAL:
+                if( byte == '"' || byte == '\'' ) {
+                    string_delimiter = byte;
+                    state = HBS_TEST_JSON_STRING;
+                } else if( byte == '/' && i + 1 < length
+                        && data[i + 1] == '/' ) {
+                    state = HBS_TEST_JSON_LINE_COMMENT;
+                    i++;
+                } else if( byte == '/' && i + 1 < length
+                        && data[i + 1] == '*' ) {
+                    state = HBS_TEST_JSON_BLOCK_COMMENT;
+                    i++;
+                } else if( (unsigned char) byte <= 0x1f
+                        && byte != '\t' && byte != '\r' && byte != '\n' ) {
+                    return 0;
+                }
+                break;
+
+            default:
+                return 0;
+        }
+    }
+    return 1;
+}
+
+struct json_object * hbs_test_json_parse_document(const char * data, size_t length)
+{
+    struct json_tokener * tokener;
+    struct json_object * result;
+    size_t parse_end;
+
+    if( length > INT_MAX
+            || !hbs_test_json_has_valid_whitespace(data, length) ) {
+        return NULL;
+    }
+    tokener = json_tokener_new();
+    if( tokener == NULL ) {
+        return NULL;
+    }
+    result = json_tokener_parse_ex(tokener, data, (int) length);
+    parse_end = (size_t) tokener->char_offset;
+    if( parse_end == length
+            && json_tokener_get_error(tokener) == json_tokener_continue ) {
+        result = json_tokener_parse_ex(tokener, "", 1);
+    }
+    while( parse_end < length ) {
+        char byte = data[parse_end];
+
+        if( byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n' ) {
+            break;
+        }
+        parse_end++;
+    }
+    if( json_tokener_get_error(tokener) != json_tokener_success
+            || result == NULL
+            || parse_end != length ) {
+        if( result != NULL ) {
+            json_object_put(result);
+        }
+        result = NULL;
+    }
+    json_tokener_free(tokener);
+    return result;
+}
+
 int hbs_test_json_dtor(struct hbs_test_json_holder * holder)
 {
     if (holder && holder->obj) {

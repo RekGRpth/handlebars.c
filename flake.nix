@@ -8,17 +8,22 @@
       url = "github:numtide/flake-utils";
       inputs.systems.follows = "systems";
     };
+    agent-badge = {
+      url = "github:jbboehr/agent-badge.ts/master";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+      inputs.gitignore.follows = "gitignore";
+    };
     mustache_spec = {
       url = "github:mustache/spec/v1.1.3";
       flake = false;
     };
     handlebars_spec = {
-      url = "github:jbboehr/handlebars-spec";
+      url = "github:jbboehr/handlebars-spec/master";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.systems.follows = "systems";
-      inputs.gitignore.follows = "gitignore";
-      inputs.pre-commit-hooks.follows = "pre-commit-hooks";
-      inputs.flake-utils.follows = "flake-utils";
+      inputs.agent-badge.follows = "agent-badge";
+      inputs.git-hooks.follows = "pre-commit-hooks";
     };
     gitignore = {
       url = "github:hercules-ci/gitignore.nix";
@@ -38,6 +43,7 @@
     self,
     nixpkgs,
     flake-utils,
+    agent-badge,
     mustache_spec,
     handlebars_spec,
     gitignore,
@@ -86,6 +92,7 @@
             stdenv = package.stdenv;
           }) {
             inputsFrom = [package];
+            packages = [agent-badge.packages.${system}.default];
             buildInputs = with pkgs; [
               actionlint
               autoconf
@@ -128,10 +135,30 @@
             attr = "handlebars-c-cmake";
             cmakeSupport = true;
           }
-          #{
-          #  attr = "handlebars-c-norc";
-          #  noRefcountingSupport = true;
-          #}
+          {
+            attr = "handlebars-c-cmake-memory";
+            cmakeSupport = true;
+            memoryTestingSupport = true;
+          }
+          {
+            attr = "handlebars-c-cmake-no-lmdb";
+            cmakeSupport = true;
+            lmdbSupport = false;
+          }
+          {
+            attr = "handlebars-c-cmake-no-json";
+            cmakeSupport = true;
+            jsonSupport = false;
+          }
+          {
+            attr = "handlebars-c-cmake-no-yaml";
+            cmakeSupport = true;
+            yamlSupport = false;
+          }
+          {
+            attr = "handlebars-c-norc";
+            noRefcountingSupport = true;
+          }
           {
             attr = "handlebars-c-debug";
             debugSupport = true;
@@ -139,6 +166,10 @@
             # Automake's Valgrind wrapper cannot invoke Bats tests with their
             # required filename argument; runtime memory checks run separately.
             valgrindSupport = false;
+          }
+          {
+            attr = "handlebars-c-memory";
+            memoryTestingSupport = true;
           }
           #{
           #  attr = "handlebars-c-lto";

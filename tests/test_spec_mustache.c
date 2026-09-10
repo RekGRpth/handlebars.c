@@ -347,7 +347,7 @@ START_TEST(test_mustache_spec)
     }
 
     // ugh
-    talloc_free(test->ctx);
+    // talloc_free(test->ctx);
 }
 END_TEST
 

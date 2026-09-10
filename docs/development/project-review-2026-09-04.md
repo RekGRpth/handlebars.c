@@ -1,0 +1,828 @@
+# Project review: 2026-09-04
+
+Reviewed commit: 7d256818b75e925484f85f31ccd8c4cdd9a8ab64.
+
+This report covers the library, CLI, build and installation workflows, tests, fuzz harnesses, documentation, and bundled C dependencies. The findings and baseline verification describe the reviewed commit and have experimental evidence. The review itself changed no production code or repository tests; subsequent fixes are recorded in status notes.
+
+P1 means fix before the next release because the defect affects packaging or a substantial runtime contract. P2 means a correctness or ownership defect in ordinary use. P3 means a narrower API, diagnostic, test, or maintenance issue. These are remediation priorities, not vulnerability severity ratings.
+
+R01 through R36 are addressed.
+
+## Verification and coverage limits
+
+| Check | Observed result |
+| --- | --- |
+| Existing Autotools configuration, make -j4 all check | 2,266 checks passed, no failures or skips |
+| Fresh GCC build with AddressSanitizer, UndefinedBehaviorSanitizer, and allocation-failure testing | 3,529 checks passed, no sanitizer diagnostics |
+| Fresh CMake Release build and CTest | All 26 test programs passed |
+| CMake Debug CLI build | Built successfully. A normal inline-partial module-print operation then hit an assertion |
+| Installed CMake headers and exported-target consumer | Both focused consumer checks failed, as detailed below |
+| CMake with LMDB unavailable and tests disabled | Configuration failed despite LMDB being optional |
+| distcheck from the allocation-failure-enabled build | Failed linking the newly configured distribution build |
+| Distribution control omitting the generated public configuration header | Fresh configuration and build succeeded |
+| Normal-input CLI, C API, allocation-count, dependency, and test-oracle probes | Results recorded under the relevant findings |
+
+The sanitizer build used GCC 15.2.0, -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined, CK_FORK=no, ASAN_OPTIONS=detect_leaks=1:halt_on_error=1, and UBSAN_OPTIONS=halt_on_error=1. It enabled HANDLEBARS_MEMORY and disabled hardening, Valgrind, and source-generator regeneration. Build and test targets were run sequentially. CMake was 4.1.6. The environment supplied Check 0.15.2, json-c 0.18, libyaml 0.2.5, LMDB 0.9.35, and talloc 2.4.4.
+
+The source review used 14 location assignments and two final cross-cutting sweeps. Enumeration found 120 C/C++ files, 2,117 units, and 73,104 lines, with no unreadable files or explicit scope exclusions reported. This includes generated code, vendored headers, and a local generated CMake compiler-identification file. Build scripts, grammar sources, CI configuration, and documentation were inspected separately.
+
+**Coverage remains unverified.** The parser reported degraded parses in 102 files. All assignments produced artifacts, but the ledger gate accepted 4,443 of 4,497 required checks and rejected 63 accounting violations. Twenty-nine sweep rows did not match enumerated unit IDs. Another 240 units, containing 16,104 lines, had no generated questions and therefore cannot be assessed by that gate. These counts are not a percentage of proven-correct code. The ledger is only a consistency check, and reviewer shell access was not technically restricted.
+
+No separate false-positive judging pass ran over the raw C-review artifacts. Those artifacts include source-only candidates and automatically promoted pointers, so their finding count must not be read as the number of confirmed defects. This report reconciles the candidates against the experiments below.
+
+No new fuzzing campaign, ThreadSanitizer run, 32-bit build, Windows/macOS run, or no-refcount build was performed. No exploitable memory-corruption defect was experimentally established. Successful sanitizer runs do not establish safety for untested inputs or platforms.
+
+The upstream runtime runner also deliberately excludes 11 runtime cases and 40 AST-inapplicable cases. Its passing result does not imply complete Handlebars compatibility.
+
+## Build and distribution
+
+### R01. P1: release archives contain configuration from the machine that created them
+
+Sources: [src/Makefile.am](../../src/Makefile.am), [src/handlebars.h:35](../../src/handlebars.h#L35).
+
+At the reviewed commit, the generated src/handlebars_config.h was listed among distributed public headers. A distribution created with allocation-failure testing enabled therefore contained HANDLEBARS_MEMORY=1. A subsequent out-of-tree configuration could disable that feature, but the quoted include in handlebars.h found the archived source-side header before the new build-side header.
+
+Experiment:
+
+- Created the archive from the sanitizer/allocation-failure build.
+- The archived header defined HANDLEBARS_MEMORY=1.
+- The distribution's newly generated header and config.h both left it undefined.
+- distcheck failed with unresolved _handlebars_talloc_* and handlebars_memory_fail_counter_incr symbols.
+- Extracted the same archive into a separate control directory, omitting only its generated public configuration header. Configuration with memory testing disabled and make -j4 all then succeeded.
+
+This can make a release depend on the maintainer's build settings. ABI-sensitive configuration switches deserve particular care, although cross-ABI memory behavior was not tested.
+
+**Status: addressed.** [src/Makefile.am:77](../../src/Makefile.am#L77) now lists the generated header in nodist_pkginclude_HEADERS, and src/Makefile.in has been regenerated. The header remains installed under include/handlebars, while release archives retain only its configuration template. The Linux CI job enables allocation-failure testing for archive creation and explicitly disables it for distcheck.
+
+The regression failed before the fix with unresolved allocation-wrapper symbols and passed afterward. The producer build passed 3,529 checks; distcheck passed 2,266 checks plus installation and cleanup checks. An external consumer compiled and ran against the installed headers and library. These checks ran locally with GCC; the full platform/compiler CI matrix was not run locally.
+
+### R02. P1: CMake publishes incorrect version and feature information
+
+Sources: [CMakeLists.txt](../../CMakeLists.txt), [cmake/handlebars_config.h.in](../../cmake/handlebars_config.h.in), [configure.ac:20](../../configure.ac#L20).
+
+At the reviewed commit, CMake reported version 0.7.2 and specification version 4.7.6, while Autotools reported 1.0.0 and 4.7.7. CMake also enabled features through compiler definitions without setting the variables used by the installed header's configuration directives.
+
+The fresh CMake CLI reported JSON and YAML support enabled, but its installed header left the JSON, YAML, LMDB, pthread, PCRE, and testing-export macros undefined. An installed-header consumer calling handlebars_cache_lmdb_ctor failed compilation with an implicit-function-declaration error even though the library was built with LMDB.
+
+The CMake tests inherit build-wide definitions, which explains why all 26 programs can pass while the installed interface is wrong.
+
+**Status: addressed.** CMake now declares the correct release and specification versions explicitly. Releases must update these constants and the installed-consumer expectations alongside configure.ac. The compiler definitions and installed header use the same resolved feature settings. Enabled feature macros have the value 1, and the header includes both specification-version strings.
+
+The new [installed consumer test](../../tests/installed_config/main.c) failed before the fix because feature macros, specification versions, and cache declarations were missing. It now compiles and runs using a temporary installation. Local GCC verification passed all 27 Release CTest programs, all 28 programs with allocation-failure testing enabled and no explicit build type, and all 28 programs with AddressSanitizer and UndefinedBehaviorSanitizer. All three CMake configurations also built and passed their tests with configure.ac absent from an isolated source copy. The existing Autotools suite passed 2,266 checks. A separate tests-disabled installation correctly omitted the PCRE feature macro.
+
+These checks cover the public configuration header; R03's exported-target requirements and R04's missing optional dependencies remain separate. Windows, macOS, and the full platform/compiler matrix were not tested locally.
+
+Independent correctness and test reviews of the feature and header changes found no actionable defects. Additional checks passed from paths containing spaces and after toggling allocation-failure testing off, on, and off in the same build. The consumer also checks that enabled feature macros equal 1 and that a memory-enabled installation links its allocation-failure implementation. Older CMake versions and multi-config generators remain untested.
+
+### R03. P2: the exported CMake target lacks its public include requirements
+
+Sources: [src/CMakeLists.txt](../../src/CMakeLists.txt), [CMakeLists.txt](../../CMakeLists.txt), [tests/CMakeLists.txt](../../tests/CMakeLists.txt).
+
+At the reviewed commit, a consumer included the installed handlebars.cmake export and linked its executable to the handlebars target. Configuration succeeded, but compiling a source file containing #include <handlebars.h> failed because the target exported no include directory.
+
+The generated interface also carried test dependencies such as Check and PCRE into consumer link requirements when tests were enabled. That dependency leakage was observed in the installed export; failure on a machine without those libraries was not separately tested during the original review.
+
+**Status: addressed.** Both exported targets now publish their build and installation header directories and the talloc include directory required by handlebars_memory.h. Required runtime libraries remain transitive. Check and PCRE include paths and link libraries are scoped to the tests.
+
+The consumer first failed because handlebars.h was missing from its include path. After the include fix, a separate check rejected Check in the imported target's link interface. The corrected exports passed both checks for shared and static consumers. Independent consumer builds also passed with ambient dependency paths removed from the environment, including probes that link JSON, LMDB, YAML, and allocation functions.
+
+The existing installed-header probe is retained. New [target probes](../../tests/installed_config/target.c) compile and run using only each imported target's usage requirements. A temporary mutation removing json-c from the static target's link requirements failed with unresolved JSON symbols, confirming the probe exercises transitive linkage.
+
+Absolute installation directories require care in the test harness: CMake records those fixed destinations in its export, so the export cannot be loaded directly from a DESTDIR staging tree. The harness keeps the header probe for all installation layouts and adds the imported-target probes when include and library destinations are relative. Absolute include-only, library-only, and combined cases passed without creating the configured destination. Both targets also passed a separate direct-install check at configured absolute paths under the temporary test directory.
+
+Fresh GCC verification passed 27 Release CTest programs, 28 with allocation-failure testing enabled and no explicit build type, and 28 with AddressSanitizer and UndefinedBehaviorSanitizer. All three consumers passed against a tests-disabled installation. Both build-tree target consumers passed, and the existing Autotools suite passed 2,266 checks. Independent review identified the absolute-path staging issue described above; the corrected harness passed its focused regressions. Runtime dependency paths still come from configure-time discovery; rediscovering dependencies on another machine is outside this slice. Older CMake versions, Windows, macOS, and multi-config generators were not tested locally.
+
+### R04. P2: missing optional LMDB prevents CMake configuration
+
+Sources: [CMakeLists.txt](../../CMakeLists.txt), [src/CMakeLists.txt](../../src/CMakeLists.txt), [fuzz/CMakeLists.txt](../../fuzz/CMakeLists.txt), [cmake/FindLMDB.cmake](../../cmake/FindLMDB.cmake).
+
+At the reviewed commit, with only the LMDB include and library directories excluded from discovery and HANDLEBARS_ENABLE_TESTS=OFF, configuration failed because LMDB_INCLUDE_DIR-NOTFOUND and LMDB_LIBRARIES-NOTFOUND were added to targets unconditionally.
+
+**Status: addressed.** LMDB include paths, link libraries, feature metadata, backend source selection, and the LMDB fuzz target now depend on successful discovery of both its header and library. The installed-header test also uses the discovery result, so finding a library without its header does not falsely imply that LMDB support is enabled.
+
+The new handlebars-c-cmake-no-lmdb configuration in [flake.nix](../../flake.nix) omits LMDB from its build dependencies and runs the existing CMake suite. It is included in the generated CI matrix. Running nix build .#handlebars-c-cmake-no-lmdb --no-link first reproduced the configuration error. Guarding the paths exposed a second failure: CMake still compiled handlebars_cache_lmdb.c without LMDB's types. Conditional source selection, matching Autotools, fixed that build failure as well. The same Nix check then passed all 27 CTest programs and installed the package.
+
+Local GCC verification passed all 27 Release CTest programs with LMDB available, all 28 programs with allocation-failure testing enabled and LMDB absent, and all 28 under AddressSanitizer and UndefinedBehaviorSanitizer with LMDB absent. A tests-disabled build without LMDB also passed the three installed-header and shared/static target consumers. Separate configurations with only the header absent or only the library absent passed builds and the cache, public-header, and installed-consumer checks. Disabling LMDB discovery with cached paths present, then re-enabling it in the same build directory, passed those checks and updated the feature macro correctly. Other platforms and older CMake versions were not tested locally.
+
+Review identified a missed consumer of the discovery result: the LMDB fuzz target still depended on the cached library path. A Clang build with fuzzing enabled succeeded initially, then failed to compile fuzz_lmdb after disabling LMDB discovery because the backend constructor was no longer declared. Gating that target on LMDB_FOUND fixed the regression. The [fuzz workflow](../../.github/workflows/fuzz.yml) now checks CMake builds with discovery enabled, disabled, and re-enabled in the same directory. This sequence passed locally with Clang 21.1.8; the workflow uses Clang 18. No fuzz inputs were needed to reproduce the build failure.
+
+**Related follow-up status: addressed.** json-c and libyaml discovery now requires both the header and library before enabling the corresponding feature. Their include paths, link libraries, installed feature metadata, backend sources, tests, and fuzz targets all use that complete discovery result. CMake can therefore configure, build, test, and install with either dependency absent. Compatibility aliases retain the uppercase discovery variables exposed by the project find modules.
+
+The new `handlebars-c-cmake-no-json` and `handlebars-c-cmake-no-yaml` configurations in [flake.nix](../../flake.nix) omit the selected dependency and run the applicable CMake suite plus installed-header and exported-target consumers. Both checks first reproduced the NOTFOUND generation errors and pass after the change. A clean build with both packages disabled passed all 18 applicable CTest programs. A cached build also passed an enabled-to-disabled-to-enabled transition for both packages; the generated feature macros, CLI feature report, compiled sources, and exported library symbols matched each configuration. The fuzz workflow now performs the same cached transition for every optional backend.
+
+Testing the no-JSON build exposed swapped skip predicates in two CLI cases: a YAML input was skipped according to JSON availability, while a JSON input was skipped according to YAML availability. Correcting those predicates makes each reduced build exercise the formats it still supports. All 12 x86_64-linux flake checks pass, including the fully enabled CMake builds and every reduced dependency configuration. Local verification used Linux, GCC, and CMake 4.1.6. Hosted Clang fuzz jobs, other platforms, older CMake versions, and multi-config generators were not run locally.
+
+Review then reproduced a mixed-build failure when an ignored Autotools-generated `src/handlebars_config.h` remained in the checkout. Quoted inclusion from `handlebars.h` selected that stale source header before CMake's generated header, so disabled parser code was still compiled while its implementation and dependency were omitted. The public header now resolves its generated configuration through the include path, and CMake places the binary header directory first. The reduced Nix checks synthesize a stale header with both parsers enabled before configuring; all 20 no-JSON and 26 no-YAML CTest programs pass. A source-tree CMake build with both parsers disabled also passes all 18 applicable programs in the presence of the real stale Autotools header.
+
+### R05. P3: Autotools release archives omit CMake support
+
+Sources: [Makefile.am](../../Makefile.am), the root and subdirectory CMakeLists.txt files.
+
+The generated handlebars-1.0.0.tar.gz contained 383 members and no CMakeLists.txt or cmake/ files. Consequently, the repository's CMake workflow cannot be used from that source archive.
+
+**Status: addressed.** The distribution lists now include the root and subdirectory CMakeLists.txt files, all CMake helper modules and configuration templates, and the installed-consumer test files. The affected Makefile.in files were regenerated with Automake 1.16.5. After distcheck, the Linux CI job extracts the archive into a separate directory, builds it with CMake and allocation-failure testing enabled, and runs CTest. It clears fixture-path overrides so the tests use the archived fixtures.
+
+The new CI step failed against the original archive because CMakeLists.txt was missing, then passed all 28 CTest programs against the corrected archive. A separate Release build with default feature options passed all 27 programs. These runs include installed-header, shared/static target, public-header, and CLI checks. Autotools distcheck passed all 2,266 checks with allocation-failure testing disabled. A tests-disabled Clang build also compiled all five optional fuzz targets from the archive. Archive inspection confirmed all 21 CMake support files are present and the generated src/handlebars_config.h remains excluded; the installed-consumer checks confirm the header is still installed. Workflow linting passed. Local verification used GCC 15.2.0, Clang 21.1.8, and CMake 4.1.6 on Linux; hosted CI and other platforms were not run.
+
+## Rendering, compilation, and parsing
+
+Unless stated otherwise, rendering experiments used the shown template on stdin, a JSON data file, and handlebarsc --no-newline. All examples use ordinary template/data inputs. Handlebars' expected conditional, inverse, and context behavior is described in its [built-in helper documentation](https://handlebarsjs.com/guide/builtin-helpers.html).
+
+### R06. P1: an expression before an inline partial can change the partial's identity
+
+Sources: [src/handlebars_opcode_serializer.c:681](../../src/handlebars_opcode_serializer.c#L681), [src/handlebars_vm.c:1251](../../src/handlebars_vm.c#L1251), [src/handlebars_vm.c:1447](../../src/handlebars_vm.c#L1447).
+
+This template rendered P:
+
+~~~handlebars
+{{#*inline "p"}}P{{/inline}}{{>p}}
+~~~
+
+Adding an ordinary preceding conditional caused rendering to fail with “The partial p could not be found”:
+
+~~~handlebars
+prefix{{#if true}}T{{/if}}{{#*inline "p"}}P{{/inline}}{{>p}}
+~~~
+
+The expected output is prefixTP. The serializer scans forward from an earlier literal-producing opcode to a later inline registration and treats the entire range as one declaration. The VM repeats that inference and can derive the declaration name from the earlier expression.
+
+**Status: addressed.** The serializer, module verifier, and VM now share a private statement-boundary predicate. Their declaration scans stop at output instructions, another decorator registration, or the end of a program, including when scanning a hash argument. An earlier expression can no longer be moved into the declaration prologue or supply its name. Supported positional arguments and nested hashes remain within the declaration.
+
+The new regression tests cover the reported conditional, escaped and unescaped helper output, expressions before/between/after multiple declarations, use before definition, extra arguments, and nested scopes. All six cases failed with the original implementation in both default and alternate-decorator modes: 12 failures reporting a missing partial. All 12 passed after the fix, including module verification, and the reported CLI template now renders prefixTP.
+
+Independent correctness and test reviews found no actionable defects. The test review added a round-trip regression covering numeric and boolean partial names interleaved with ordinary expressions. It copies, normalizes, verifies, relocates, and executes a compiler-produced module in both decorator modes. The test passed with the fix and failed with a missing partial in a temporary copy with the boundary checks reverted.
+
+Final GCC verification used cmake --build and ctest --output-on-failure: all 28 Release CTest programs and all 28 Debug programs with AddressSanitizer, UndefinedBehaviorSanitizer, and allocation-failure testing enabled passed. Autotools make -j4 all followed by make -j4 check passed all 2,279 checks with allocation-failure testing disabled. The sanitizer runs used CK_FORK=no and reported no sanitizer diagnostics. Markdown linting passed. Reliability verdict: PASS_WITH_RESIDUAL_RISK; hosted CI and other platforms were not run.
+
+A later hosted scan-build run could not prove that the inline-partial range scanner initialized its program-offset output before the installer indexed the opcode array. The installer now initializes that local value before asking the scanner to replace it. Clang 21's analyzer reproduced the warning before this follow-up and reported no finding afterward; valid ranges still use the scanner-provided offset.
+
+### R07. P2: printing a valid inline-partial module aborts in a debug build
+
+Sources: [src/handlebars_opcodes.c:317](../../src/handlebars_opcodes.c#L317), [src/handlebars_opcode_serializer.c:620](../../src/handlebars_opcode_serializer.c#L620), [src/handlebars_opcode_printer.c:144](../../src/handlebars_opcode_printer.c#L144).
+
+At the reviewed commit, serializing an inline declaration set a third operand on registerDecorator, but its operand-count metadata still said two. Running --module on the simple inline template from R06 in the fresh CMake Debug build terminated with SIGABRT at the printer's assertion that operand three is null.
+
+The Release build completed but omitted that operand from the printed representation.
+
+**Status: addressed.** The opcode metadata now allows three operands for registerDecorator, and its API documentation identifies the count as a maximum including optional operands. Printing includes a present third operand and preserves the existing two-operand compiler representation when that operand is absent.
+
+The direct printer test covers an absent marker and both boolean values. An integration test compiles and serializes an ordinary inline partial, verifies the module, and checks that printing includes both the true registration marker and the partial body. Before the fix, this integration test reproduced the missing marker in Release and the assertion abort in Debug. Both builds now pass the affected compiler, opcode, and printer suites.
+
+### R08. P1: cached partials reuse bytecode compiled with different flags
+
+Source: [src/handlebars_vm.c:919](../../src/handlebars_vm.c#L919).
+
+At the reviewed commit, the runtime cache used template text as its key, although compilation also depends on VM flags.
+
+A C API probe rendered a partial containing {{value}} with the ordinary value “a & b”:
+
+| Step | Configuration | Actual output |
+| --- | --- | --- |
+| 1 | Enable no_escape and populate cache | a & b |
+| 2 | Disable no_escape, retain cache | a & b |
+| 3 | Keep no_escape disabled, reset cache | a &amp; b |
+
+Thus changing compilation settings does not reliably change rendering when a cache entry already exists. A strict-mode comparison did behave correctly and is not evidence for a strict-mode failure.
+
+**Status: addressed.** Runtime cache keys now combine the processed template bytes, a NUL separator, and the effective compiler flags. Lookup, insertion, and release use the same temporary key. This preserves compatibility-mode preprocessing and allows different compilation settings to coexist in one cache. The key uses the flags active during execution, including flags inherited from the calling module.
+
+Twelve regression cases cover simple, mmap, and LMDB caches, both orders of escaped/unescaped rendering, and a single VM changing flags or two VMs sharing a cache. All twelve failed before the fix with stale escaping and passed afterward. Each case also checks that both variants remain cached, subsequent renders hit those entries, and no lookup references remain active. Existing cache error and ownership fixtures still exercise preloaded hits using the internal key format.
+
+Independent test review added nine cases covering inherited no_escape and ignore_standalone flags, reuse when equivalent settings come from the VM or calling module, and separation from legacy raw-template entries. The complete focused group passes all 21 cases.
+
+The direct cache API still accepts caller-provided keys. Old entries keyed only by template text are no longer used by the VM and will be rebuilt on demand. The VM setter documentation now states that its key encoding is internal and that raw template keys do not preload its runtime cache.
+
+The separator and flags add 2–5 bytes to LMDB keys, slightly reducing the maximum cacheable template length. Two focused boundary checks confirmed that a template just inside the new limit is cached and one just outside still renders correctly on repeated calls without caching.
+
+Fresh Linux verification passed all 28 CTest programs in both Release and Debug ASan/UBSan builds with allocation-failure testing enabled. The Autotools build with allocation-failure testing disabled passed 2,300 checks. Verification used `cmake --build <build> -j4` followed by `ctest --test-dir <build> --output-on-failure`, and `make -j4 all` followed by `make -j4 check`. The focused group runs with `CK_RUN_CASE='Partial cache compilation settings' <build>/tests/test_cache`.
+
+Independent correctness and test reviews found no actionable production regressions. Reliability verdict: PASS_WITH_RESIDUAL_RISK. Other platforms, no-refcount builds, and individual behavior checks for the remaining compiler flags were not tested for this slice.
+
+### R09. P2: some numeric literals reach helpers as strings
+
+Sources: [src/handlebars_compiler.c:1404](../../src/handlebars_compiler.c#L1404), [src/handlebars_vm.c:2747](../../src/handlebars_vm.c#L2747).
+
+| Template | Actual | Expected |
+| --- | --- | --- |
+| {{#if 0}}T{{else}}F{{/if}} | F | F |
+| {{#if 0.0}}T{{else}}F{{/if}} | T | F |
+| {{#if -0}}T{{else}}F{{/if}} | T | F |
+
+Some numeric spellings are stored as string operands and pushed into the VM as string values. This changes helper-visible types and truthiness.
+
+Preserve numeric type information through compilation and execution. Restore meaningful type assertions in the ported helper fixtures, including the disabled checks in tests/fixtures.c, and cover equivalent zero spellings.
+
+**Status: addressed.** Numeric compilation now emits the existing long operand for integral values and a dedicated double operand for fractional values. The VM pushes doubles as floating-point values, and module serialization, shape verification, hashing, printing, and upstream compiler-fixture loading understand the new scalar type. Existing operand enum values remain unchanged. The previously disabled helper-fixture type checks now require integer or floating-point values.
+
+Numeric parsing and formatting use a shared ASCII-decimal policy instead of depending on the process locale. This keeps templates with `.` decimal syntax valid under comma-decimal locales and gives rendered values, lookup keys, value dumps, numeric inline-partial declarations and invocations, and printed opcodes the same round-tripping representation. Partial-name formatting follows the JavaScript fixed/exponent thresholds at 10^-6 and 10^21 and normalizes exponent spelling. Matching declarations and invocations now work for fractional zero, longer fractional values, and values around both thresholds.
+
+The initial focused run failed both new numeric-literal cases: `-0` reached a helper as a string, and five of six zero spellings selected the true branch. Re-enabling the upstream fixture assertions also made the decimal-helper case render `NaN` values. A later review found that runtime coercion still used six-digit, locale-sensitive `%g`; focused regressions reproduced precision loss in rendered values and lookup keys and a comma decimal in rendered output. After the fixes, the focused group passes all cases, the runtime specification passes all 850 checks, and the compiler specification passes all 462 checks. Additional tests cover serialized operand types and verifier rejection, enum stability, exact printer and value-dump round trips, comma-decimal compilation and formatting, inline-partial module copying and pointer normalization, and Handlebars-compatible numeric partial names.
+
+Fresh final Linux verification passed all 29 CTest programs in Release and Debug ASan/UBSan builds with allocation-failure testing enabled. The compiler and opcode-printer suites also passed under `de_DE.utf8`. All ten x86_64-linux flake checks passed, including Autotools, CMake, allocation-failure, no-refcount, minimal, static, and no-LMDB variants. Independent correctness and adversarial test reviews reproduced locale and numeric-name defects in the first implementation; those regressions were fixed, their focused tests pass, and the final re-review found no actionable defect. Reliability verdict: PASS_WITH_RESIDUAL_RISK. macOS, Windows, 32-bit `long`, and applications that concurrently mutate the process-global locale remain unverified.
+
+A hosted CI follow-up exposed two test-portability defects. Clang treats the standard `NAN` and `INFINITY` macros as float expressions on the affected systems, so the double-valued test tables now cast them explicitly. Musl 1.2.5 accepts `de_DE.UTF-8` while retaining the C locale's decimal point; the locale-sensitive tests now require the observed comma convention before running and restore the previous numeric locale afterward. A standalone musl experiment reproduced that behavior, and the affected sources compile without double-promotion errors under Clang 18 and 21.
+
+### R10. P2: conditional helpers mishandle includeZero
+
+Source: [src/handlebars_helpers.c:446](../../src/handlebars_helpers.c#L446), [src/handlebars_helpers.c:499](../../src/handlebars_helpers.c#L499).
+
+With data {"n":0}:
+
+| Template | Actual | Expected |
+| --- | --- | --- |
+| {{#if n includeZero=false}}yes{{else}}no{{/if}} | yes | no |
+| {{#if n includeZero=true}}yes{{else}}no{{/if}} | yes | yes |
+| {{#unless n includeZero=true}}yes{{else}}no{{/unless}} | yes | no |
+
+The if implementation tests whether the option exists rather than its value. Unless converts its argument to a boolean before delegating, losing the zero-specific behavior.
+
+**Status: addressed.** The helpers now use Handlebars-compatible emptiness locally. Both integer and floating-point zero honor the value of includeZero; NaN stays empty, while nonempty strings (including "0") and objects stay truthy. Unless delegates to the registered if helper with the original argument and swapped branches, preserving caller arguments and options. Callable conditions are evaluated once with the original scope. These rules follow the [4.7.9 conditional helpers](https://github.com/handlebars-lang/handlebars.js/blob/v4.7.9/lib/handlebars/helpers/if.js) and [emptiness utility](https://github.com/handlebars-lang/handlebars.js/blob/v4.7.9/lib/handlebars/utils.js).
+
+The new Conditional helpers group checks native scalar and collection values, lazy JSON collections, option truthiness, callable results and call counts, and registered-if delegation. Against cc527fff, 26 of its initial 41 cases failed; extending the existing callable cleanup tests to unless produced two additional failures. All now pass. Numeric inputs are constructed through the C value API so these tests do not depend on the literal-compilation behavior tracked by R09. The public conversion API remains a separate R26 task.
+
+### R11. P2: with uses the wrong empty-value and inverse-context rules
+
+Source: [src/handlebars_helpers.c:568](../../src/handlebars_helpers.c#L568).
+
+The template {{#with n}}yes{{else}}no{{/with}} rendered yes for n=false, n="", and n=[].
+
+For {"n":null,"name":"outer"}, this template rendered fallback= instead of fallback=outer:
+
+~~~handlebars
+{{#with n}}{{name}}{{else}}fallback={{name}}{{/with}}
+~~~
+
+Only null selects the inverse branch, and that branch executes with the null value rather than the original scope.
+
+**Status: addressed.** With now selects its inverse for null, false, NaN, empty strings, and empty arrays, preserving the original scope there. Zero and empty objects select the main block, following the [4.7.9 with helper](https://github.com/handlebars-lang/handlebars.js/blob/v4.7.9/lib/handlebars/helpers/with.js). The shared helper regressions cover these distinctions and callable results.
+
+Three existing stack-boundary fixtures now terminate recursion with null instead of an empty object. They retain their original recursion depth and assertions under the corrected truthiness rules; retaining the empty-object terminator added an unintended level of recursion and produced stack-overflow errors.
+
+Independent correctness and test reviews identified the same regression in the initial patch: checking a custom array's emptiness unconditionally called its optional count callback. The added regression uses the existing indexed-array fixture without that callback; it passed at cc527fff and failed with the initial helper patch. The helper now checks callback availability and preserves the positive branch when a custom array's size is unavailable, while arrays reporting a count of zero still select the inverse. The regression passes after the repair.
+
+A follow-up review found the equivalent custom-string defect: the native string-length getter returned zero for every custom value advertising an effective string type, even when its count callback reported a nonzero length. The conditional predicate now uses that callback when available and, as with custom arrays, preserves the positive branch when length is unavailable. The regression covers empty, nonempty, and unknown-length custom strings across if, unless, and with.
+
+An adversarial test review then found that unless reset the swapped program's block-parameter metadata to zero. Inverse-form blocks can declare parameters, so an overridden if helper received a valid child program paired with the wrong declaration count. Unless now obtains metadata through the VM's existing validated program lookup after swapping branches, and a rendered inverse-form regression covers the override contract.
+
+Final verification for R10–R11 used Linux GCC 15.2.0. The focused group, `CK_RUN_CASE='Conditional helpers' <build>/tests/test_value`, passes all 46 cases. CMake Release and Debug ASan/UBSan builds with allocation-failure testing enabled each pass all 29 CTest programs, using `cmake --build <build> -j4` followed by `ctest --test-dir <build> --output-on-failure -j4`. Sanitizer runs use `CK_FORK=no`, `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1`, and `UBSAN_OPTIONS=halt_on_error=1`, with no sanitizer diagnostics. Autotools `make -j4 all` followed by `make -j4 check`, with allocation-failure testing disabled, passes all 2,358 checks without failures or skips. All nine Linux Nix package checks pass, including Debug with warnings as errors, no-refcount, minimal, static, memory-testing, CMake, and no-LMDB configurations. The repository-wide flake check remains blocked by pre-existing Markdown errors in the vendored Mustache specification; the changed report passes its configured Markdown hook.
+
+Reliability verdict: PASS_WITH_RESIDUAL_RISK. The demonstrated review regressions are fixed and covered by retained tests. Hosted CI and non-Linux platforms were not run for this slice.
+
+### R12. P2: root and parent data references resolve to the current frame
+
+Source: [src/handlebars_vm.c:2564](../../src/handlebars_vm.c#L2564).
+
+Two independent normal-input checks failed:
+
+- With {"name":"ROOT","child":{"name":"CHILD"}}, {{#with child}}{{@root.name}}{{/with}} rendered CHILD instead of ROOT.
+- With {"outer":[[1,2],[3]]}, nested iteration rendered the wrong parent indices:
+
+~~~handlebars
+{{#each outer}}{{#each this}}[{{@../index}},{{@index}}]{{/each}}{{/each}}
+~~~
+
+Actual: `[0,0][1,1][0,0]`. Expected: `[0,0][0,1][1,0]`.
+
+The fallback for root uses the current context-stack top. Parent-data traversal can reuse the current metadata when the parent link is missing.
+
+Establish an explicit root reference and parent-linked data frames, with tests where parent and child values differ. Repeated equal values would mask these errors.
+
+**Status: addressed.** Initial top-level renders create an explicit data frame for native maps that do not already define `root`. The frame preserves supplied entries, links `_parent` to the caller's data, and records the initial context as `root` without mutating caller-owned data. Existing explicit roots, including null, remain authoritative. Lazy user-backed maps retain delegated lookups through native child frames, including unconverted JSON data. Reentrant public renders retain their configured data while establishing a root for the nested context. Each and block-partial calls create linked child frames, missing parent traversal stays missing, and helper-replaced data no longer recovers a root or partial-block closure from VM stacks. Lazy data can still supply a previous partial-block closure through the active frame. Checkpoints also restore delegated-lookup metadata after caught nested failures. Sixteen focused regressions plus allocation-failure coverage exercise native and user-backed data, explicit roots, nested renders, block partials, strict null lookup, helper replacement, rollback, and over-depth traversal.
+
+### R13. P2: partial blocks bypass whitespace processing
+
+Source: [src/handlebars_whitespace.c:520](../../src/handlebars_whitespace.c#L520).
+
+The partial-block case is ignored by the whitespace visitor. This fallback template retained both standalone tag lines as blank lines:
+
+~~~handlebars
+A
+{{#> missing}}
+B
+{{/missing}}
+C
+~~~
+
+Actual bytes: A\n\nB\n\nC. Expected standalone-line handling: A\nB\nC.
+
+Explicit trim markers were also ineffective in the tested fallback block: A {{~#> missing~}} B {{~/missing~}} C rendered A  B  C.
+
+Apply whitespace handling to partial blocks, including their opening and closing strip flags. Cover both a supplied partial and fallback execution.
+
+**Status: addressed.** Partial blocks now use the same whitespace visitor as ordinary blocks, including the parent-program cleanup that removes standalone opening and closing lines. Focused compatibility checks cover fallback and supplied execution, standalone and explicit trimming, independent trim markers, ignored standalone processing, indentation, nesting, and partial blocks compiled from supplied string partials.
+
+### R14. P2: whitespace changes inverse syntax into a different construct
+
+Source: [src/handlebars.l:288](../../src/handlebars.l#L288), [src/handlebars.l:308](../../src/handlebars.l#L308), and the generated lexer.
+
+| Template | Actual |
+| --- | --- |
+| {{#if false}}A{{^}}B{{/if}} | B |
+| {{#if false}}A{{^ }}B{{/if}} | Syntax error |
+| {{#if false}}A{{else if true}}B{{/if}} | B |
+| {{#if false}}A{{ else if true}}B{{/if}} | Empty output |
+
+These rules use \s where the Flex grammar needs its existing WHITESPACE definition. The resulting scanner does not implement the intended whitespace match.
+
+Correct the grammar and regenerate the committed lexer. Keep these comparisons in both tokenizer and render tests.
+
+**Status: addressed.** The two inverse rules now use the lexer's existing `WHITESPACE` definition, and the committed scanner has been regenerated with Flex 2.6.4. The inverse-chain rules also implement the right word boundary used by Handlebars.js, so identifiers such as `elsex`, `else_foo`, and `else2` remain ordinary paths while end-of-input remains a valid keyword boundary. Tokenization and rendering regressions cover spaces, tabs, line endings, trim markers, keyword boundaries, incomplete input, and punctuation forms accepted as inverse chains.
+
+### R15. P2: a final backslash breaks compatibility-mode rendering
+
+Source: [src/handlebars_delimiters.c:94](../../src/handlebars_delimiters.c#L94).
+
+Rendering ordinary text ending in a backslash with --flags=compat failed with “Template contains an embedded NUL byte.” The delimiter preprocessor advances past the final backslash and appends the terminator as content.
+
+Handle a final backslash explicitly without appending a terminator byte. Add a literal-text regression and a preprocessor output-length assertion.
+
+**Status: addressed.** The delimiter preprocessor now copies a following escaped byte only when one remains, so a final backslash is preserved without adding the string terminator to the processed template. Unit regressions compare exact lengths and bytes for one- and two-byte backslash runs, literal text, escaped delimiter-like text, and a delimiter switch followed by a final backslash. CLI regressions render the ordinary and delimiter-switch forms in compatibility mode. Independent correctness and adversarial test reviews found no actionable defect. Fresh Linux verification passed the compiler, CLI, and Mustache delimiter suites, ASan/UBSan checks, and all ten flake checks. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux platforms were not run.
+
+### R16. P2: AST reconstruction changes literal-key lookup meaning
+
+Sources: [src/handlebars_ast_helpers.c:278](../../src/handlebars_ast_helpers.c#L278), [src/handlebars_ast_printer.c:924](../../src/handlebars_ast_printer.c#L924).
+
+A parse → handlebars_ast_to_string → render experiment used:
+
+~~~json
+{"a.b":"LITERAL","a":{"b":"NESTED"}}
+~~~
+
+The original template {{[a.b]}} rendered LITERAL. Reconstruction produced {{a.b}}, which rendered NESTED.
+
+The original path loses the information needed to reconstruct its literal segment. Preserve or recreate literal-segment quoting and compare rendering semantics in round-trip tests. String-literal backslash reconstruction remains unverified and is not included as a confirmed defect.
+
+**Status: addressed.** AST source reconstruction now combines the path's normalized prefix with each segment's stored source form, preserving bracket literals without changing the normalized identifiers used by compilation and lookup. It emits canonical escapes for literal `]` bytes and terminal backslashes, and falls back to the normalized path for compiler-created segments that have no lexer metadata. Regressions cover lookup semantics, literal segments in each path position, dot and slash separators, data/depth/scoped paths, block tags, escaped partials, compiler-transformed ASTs, string-parameter and tracked-ID metadata, and allocation failures. The upstream bracket-path exclusion was removed, enabling 410 AST reconstruction fixtures. Independent review also checked 1,555 short bracket/backslash combinations. Fresh Linux verification passed the affected suites under ASan/UBSan and all ten flake checks. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux platforms and exhaustive arbitrary-length inputs were not run.
+
+### R17. P2: this recognition misclassifies ordinary identifiers
+
+Sources: [src/handlebars_ast_helpers.c:492](../../src/handlebars_ast_helpers.c#L492), [src/handlebars_compiler.c:667](../../src/handlebars_compiler.c#L667).
+
+With {"items":["A","B"]}, an each block parameter named item rendered AB, while the same template using mythis rendered an empty string:
+
+~~~handlebars
+{{#each items as |mythis|}}{{mythis}}{{/each}}
+~~~
+
+The scoped-path predicate uses a substring match and incorrectly bypasses block-parameter lookup.
+
+A separate tracked-ID check compiled {{h thisName}} with track_ids. The lookup retained thisName, but pushId contained Name.
+
+Recognize the this path component and its permitted separators, rather than substrings or unbounded prefixes. Test identifiers that begin with, end with, or contain those letters.
+
+**Status: addressed.** Ordinary paths are now scoped only when they begin with `.` or use bare `this`, `this.`, or `this/`. Identifiers such as `thisName`, `this-name`, `this$foo`, `mythis`, `thingthis`, and nested forms such as `mythis.foo` remain ordinary paths and resolve as block parameters. Tracked IDs use the same boundary, preserving ordinary names while normalizing `this.foo` and `this/foo` to `foo`. Data paths and bracket literals retain their established classification and tracked-ID metadata for compatibility. The regressions first reproduced empty block-parameter output and truncated tracked IDs, then passed across punctuation, position, case, nested lookup, data-path, and bracket-literal controls. Fresh Linux verification passed all 2,492 Autotools checks and the CMake allocation-failure check. Independent correctness and adversarial test reviews found no actionable defect. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux platforms and exhaustive identifier-byte combinations were not run.
+
+### R18. P3: tracked numeric IDs are truncated
+
+Source: [src/handlebars_compiler.c:682](../../src/handlebars_compiler.c#L682).
+
+Compiling {{h 12345678901}} with track_ids produced:
+
+~~~text
+pushId[STRING:NumberLiteral][LONG:1234567890][NULL]
+pushLiteral[LONG:12345678901]
+~~~
+
+The helper argument and its tracked ID disagree because the numeric scan uses %10ld, which consumes at most ten characters.
+
+Use a checked conversion covering the supported integer type, or carry the numeric operand directly. Test IDs against their associated argument values.
+
+**Status: addressed.** Numeric tracked IDs now use the same checked parser and type decision as their associated literal operands. Values representable as `long` remain integer operands; fractional values and integers outside the platform's `long` range remain double operands. Serialized-module validation now permits that existing double operand type for `pushId`. The initial regression failed four of six cases, reproducing positive and negative ten-character truncation as well as fractional truncation. Eleven passing cases now cover zero spellings, signs, `LONG_MIN`, `LONG_MAX`, one-step overflow, much larger integers, fractions, module hashing and verification, and a comma-decimal locale. Fresh Linux verification passed all 2,503 Autotools checks, the CMake allocation-failure check, and 116 compiler checks under ASan/UBSan without test forking. Independent correctness and adversarial test reviews found no actionable defect. Reliability verdict: PASS_WITH_RESIDUAL_RISK; 32-bit and non-Linux builds were not run.
+
+## Data conversion, containers, and ownership
+
+### R19. P2: recursive conversion of native containers discards converted children
+
+Source: [src/handlebars_value.c:386](../../src/handlebars_value.c#L386).
+
+A C API probe inserted a JSON-backed object into a native array and, separately, a native map. After handlebars_value_convert on each container, retrieving its child still reported real type USER. Converting the same JSON wrapper directly reported MAP.
+
+The traversal converts the iterator's copied current value without writing the replacement back to the container.
+
+Convert actual stored slots, or publish converted children through the appropriate container mutation operation while respecting iterator and copy-on-write rules. Test mixed native/wrapped containers, not only a wrapped root.
+
+**Status: addressed.** Recursive conversion now reports whether a parent must publish a changed child and writes changed children through native container mutation operations. Array publication accounts separately for stored ownership and traversal-only references. Logically unique caller-backed arrays therefore update in place, while direct or inherited aliases force a heap-backed copy before mutation.
+
+The first regression reproduced USER-backed children remaining in native arrays and maps. Independent review then found that the initial publication fix mistook its own iterator reference for an alias and raised `Stack overflow` for a caller-backed array. A second review found the same problem one level deeper because an ancestor iterator also retains its current child; focused tests reproduced both failures before their fixes. The tests now cover both native container types, nested mixed containers, multiple map siblings, shallow followed by recursive conversion, caller-backed arrays nested under arrays and maps, direct and inherited copy-on-write aliases, protected-slot atomic rejection and retry, and allocation failures during conversion and publication. Fresh Linux verification passed all 3,779 Autotools checks, the 2,484-check no-refcount Nix build, and the 36-case JSON and 178-case value suites under ASan/UBSan without test forking. Independent correctness and adversarial test reviews found no remaining actionable defect. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux and cross-context mixed-container inputs were not run.
+
+### R20. P2: JSON scalar termination and null membership are inconsistent
+
+Sources: [src/handlebars_json.c:466](../../src/handlebars_json.c#L466), [src/handlebars_json.c:214](../../src/handlebars_json.c#L214), [src/handlebars_json.c:230](../../src/handlebars_json.c#L230).
+
+Two separate behaviors were confirmed:
+
+| Input or operation | Actual result | Control |
+| --- | --- | --- |
+| Data file containing exactly 1, true, or null | JSON “continue” error | Adding one trailing newline succeeds |
+| Strict lookup of known in {"known":null}, using --no-convert-input | “known” not defined | Native conversion succeeds and renders empty |
+
+The length-delimited parser does not finish scalar parsing at the supplied document boundary. Lazy object/array lookup also uses a null pointer as both “absent” and “present with JSON null.”
+
+Finalize parsing without requiring callers to add whitespace. Use explicit membership/index validity checks independently of the returned JSON value. Test scalar documents at exact length and native/lazy parity for null members.
+
+**Status: addressed.** When json-c requests more input at the supplied document boundary, the adapter feeds it a virtual terminator without reading beyond the caller's buffer. Numeric values completed at that boundary must also match the JSON number grammar, preventing permissive json-c finalization from accepting incomplete or extension forms. Lazy object lookup now uses explicit key membership, and lazy array lookup checks the index against the array length before wrapping a possibly null element.
+
+The original exact-length scalar and lazy-null tests both failed before the fix. Adversarial review then showed that the first EOF-finalization implementation accepted `1e` as `1`; the retained negative matrix covers incomplete keywords and numbers as well as `1.`, `01`, `1.e2`, `NaN`, and `Infinity`, while preserving the destination and error boundary. Positive cases cover integers, fractions, exponents, strings, booleans, null, nonterminated buffers, and excluded suffix bytes. End-to-end CLI tests cover exact scalar data files and strict lazy-null lookup. Fresh Linux verification passed all 3,784 Autotools checks, the 2,489-check no-refcount Nix build, and all 39 JSON checks under ASan/UBSan without test forking. Independent correctness review found no remaining defect. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux platforms and json-c versions other than 0.18 were not executed. Whole-document trailing-content validation remains the separate R32 follow-up.
+
+### R21. P2: YAML quoted scalars are converted to non-string values
+
+Source: [src/handlebars_yaml.c:343](../../src/handlebars_yaml.c#L343).
+
+For the template {{#if value}}truthy{{else}}falsy{{/if}}:{{value}}:
+
+| YAML | Actual output |
+| --- | --- |
+| value: "false" | falsy:false |
+| value: "0012" | truthy:12 |
+
+The first should remain a nonempty string, and the second should retain its leading zeros. Scalar conversion ignores the quoting style when inferring types.
+
+Respect scalar style and explicit type information when resolving YAML values. Add paired quoted/unquoted tests that inspect both type and output. Explicit-tag behavior was inspected in source, but the !!str 12 rendering probe alone did not distinguish its runtime type.
+
+**Status: addressed.** Non-plain scalar styles carrying libyaml's default string tag now bypass boolean and numeric inference. Single-quoted, double-quoted, literal, and folded values therefore retain both their string type and exact scalar contents. Explicit non-string tags continue through the pre-existing conversion path, so quoting does not force supported tagged boolean or integer values to strings.
+
+The type-level regression initially reported `HANDLEBARS_VALUE_TYPE_FALSE` for `"false"` instead of `HANDLEBARS_VALUE_TYPE_STRING`. The end-to-end regression produced `falsy:false` and `12` for the two quoted examples. The retained tests pair plain and quoted values, cover every non-plain style, nested maps, explicit boolean and integer tags, the public node API, value lifetime after deleting the YAML document, truthiness, and rendered output.
+
+Libyaml 0.2.5 composes an explicit plain `!!str false` into the same tag and style metadata as an implicit plain `false`; the public node API cannot distinguish those inputs. Full YAML core-schema lexical forms and invalid explicit-tag policy remain separate, pre-existing concerns. Independent correctness review and a narrowed adversarial follow-up found no in-scope defect. Fresh Linux verification passed all 3,787 Autotools checks, the 2,492-check no-refcount Nix build, and all 19 YAML tests under ASan/UBSan without test forking. Reliability verdict: PASS_WITH_RESIDUAL_RISK; other platforms and libyaml versions were not executed.
+
+### R22. P2: CLI YAML dispatch depends on filename length and parsed truthiness
+
+Source: [bin/handlebarsc.c:809](../../bin/handlebarsc.c#L809).
+
+The same file contents, name: world, rendered successfully as aa.yml but failed as a.yml with a JSON parse error. The shared suffix guard requires more than five characters, incorrectly excluding a one-character .yml basename.
+
+After successful YAML conversion, the CLI uses handlebars_value_is_empty to decide whether to parse again as JSON. Files containing a YAML document marker followed by false, 0, or [] all failed with JSON errors. The corresponding true document succeeded.
+
+Select the parser once from the input format. Track parse success separately from the parsed value. Test short relative filenames and each valid falsy YAML root.
+
+**Status: addressed.** The CLI now selects YAML only for an exact `.yaml` or `.yml` suffix and otherwise selects JSON. That choice is independent of the parsed value, so valid YAML roots such as `false`, `0`, and `[]` are no longer mistaken for a failed parse and passed to the JSON parser.
+
+The short relative `a.yml` case and all three falsy roots failed with JSON parse errors before the fix. The retained CLI regressions also cover filenames shorter than either YAML suffix, suffix near-misses, empty data files, and the YAML-disabled error path. Independent correctness and adversarial reviews found no remaining defect. Fresh Linux verification passed all 3,793 Autotools checks, the 2,498-check no-refcount Nix build, the full 118-case CLI suite, and the focused suffix and parser-dispatch cases under ASan/UBSan. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux filename behavior and a JSON-disabled build were not executed.
+
+### R23. P2: duplicate cache keys have three different contracts
+
+Sources: [src/handlebars_cache.h:165](../../src/handlebars_cache.h#L165), [src/handlebars_cache_simple.c:192](../../src/handlebars_cache_simple.c#L192), [src/handlebars_cache_mmap.c:480](../../src/handlebars_cache_mmap.c#L480), [src/handlebars_cache_lmdb.c:313](../../src/handlebars_cache_lmdb.c#L313).
+
+A normal C API probe added a module rendering first, then another module rendering second, under the same key:
+
+| Backend | Second add status | Module found afterward |
+| --- | --- | --- |
+| Simple | Error | first |
+| mmap | Success | first |
+| LMDB | Success | second |
+
+The public header says duplicate insertion is an error. Backend changes therefore alter observable behavior.
+
+Choose and document one duplicate policy, or expose the difference explicitly. Run the same contract tests against every backend rather than using backend-specific expectations alone.
+
+**Status: addressed.** All cache backends now enforce the documented duplicate policy: insertion of a byte-equal second key raises `HANDLEBARS_ERROR`, preserves the first module, and leaves the rejected module owned by its caller. The mmap backend checks the existing table while holding its lock, including while a reset is deferred by active readers. LMDB validates an existing record inside its write transaction, rejects a valid live duplicate, and atomically replaces an invalid or expired record.
+
+The shared three-backend regression initially failed for mmap and LMDB, which returned success; LMDB also overwrote the first module. Review found three further problems and each was reproduced: mmap returned success during a deferred reset, LMDB allocation failure could mask a known duplicate, and unusable LMDB records prevented later refreshes. A deterministic VM test also forces the miss-compile-add interleaving in which another producer inserts first; the VM now re-reads the key, renders the winner, and releases its cache reference while preserving any pre-existing VM diagnostic. Genuine add failures still propagate when the re-read is a miss. The reset regression performs a final reset after releasing its held reference, so its cleanup no longer depends on the reset worker completing within 500 ms.
+
+The retained tests cover distinct but byte-equal key objects, diagnostics, entry count, caller ownership, first-module rendering, structurally malformed records with valid hashes, expiration, allocation failure, post-error lookup, LMDB write usability, VM error preservation, and recovered-winner release accounting. Fresh Linux verification passed all 3,802 Autotools checks, all 124 cache checks under ASan/UBSan without test forking, and fresh no-refcount, CMake no-LMDB, and minimal Nix builds. Codex independently reviewed the final error, ownership, transaction, and cleanup paths. An independent Test Attacker reproduced an allocation-failure misclassification in LMDB refresh and added the retained regression; the repair reports `HANDLEBARS_NOMEM`, preserves the unusable record until a retry can replace it, and also preserves verifier allocation failures. Reliability verdict: PASS_WITH_RESIDUAL_RISK; a fresh Breaker rerun could not complete because the agent service quota was exhausted, and non-Linux locks plus simultaneous process-level LMDB writers were not executed.
+
+### R24. P2: compatibility-mode partial rendering retains temporary strings
+
+Source: [src/handlebars_vm.c:2424](../../src/handlebars_vm.c#L2424).
+
+A C API probe repeatedly rendered a cached partial using the same VM and released every returned output. In compatibility mode, allocations owned by the VM grew as follows:
+
+| Renders | Live VM blocks | Live VM bytes |
+| --- | --- | --- |
+| 1 | 5 | 481 |
+| 10 | 14 | 706 |
+| 100 | 104 | 2,956 |
+
+The ordinary-mode control stayed at four blocks and 456 bytes. The compatibility append path copies the expression buffer but does not release it. The ordinary indentation path consumes that buffer.
+
+This is retained memory during VM reuse, not a process-exit leak. Context destruction still frees it, so LeakSanitizer's passing result is consistent with this experiment.
+
+Release the temporary in the compatibility path with appropriate cleanup on errors. Add a warmed-up, repeated-render allocation assertion. The existing compatibility regression in tests/test_cache.c renders twice without measuring retention and overwrites its first output pointer.
+
+**Status: addressed.** Compatibility-mode partial invocation now releases the rendered-expression string after appending it, and the guarded partial-call state owns that string until the append succeeds so an allocation failure releases it exactly once. Compatibility indentation also allocates its processed template under the per-execution context, allowing the existing error boundary to reclaim it on a long jump.
+
+The warmed-cache regression failed before the repair with 103 retained VM blocks against a baseline of three after 100 renders. The retained tests cover large expression-producing partials, an empty partial, byte and block stability, cache reuse, every injected allocation failure through a successful render, and successful retry after each handled failure. Adversarial testing exposed two older indentation failures: compatibility preprocessing retained a VM-owned string, and ordinary indentation could reallocate the output repeatedly before a later failure made rollback dereference the old freed pointer. Indentation now computes the final size with checked arithmetic, reserves once, and completes without another allocating operation, preserving self-append behavior while removing that stale-pointer window.
+
+Fresh Linux verification passed all 3,805 Autotools checks, all 127 cache checks and 72 string checks under ASan/UBSan, the same focused suites with reference counting disabled, a full no-refcount Nix build, and both exposed indentation failures under Valgrind with zero errors or live blocks. An independent Test Attacker reproduced both failure paths against the prior revision and retained deterministic allocation-failure regressions; a focused independent re-review found no remaining correctness defect. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux allocator behavior and dynamic or callable partials under injected allocation failure were not executed.
+
+### R25. P2: string APIs have inconsistent result and input ownership
+
+Sources: [src/handlebars_string.h:154](../../src/handlebars_string.h#L154), [src/handlebars_string.c:565](../../src/handlebars_string.c#L565), [src/handlebars_string.h:294](../../src/handlebars_string.h#L294), [src/handlebars_string.c:996](../../src/handlebars_string.c#L996).
+
+Two benign ownership probes established:
+
+- handlebars_str_replace promises a newly allocated result. Empty input and empty search returned the original pointer, while an ordinary replacement returned a distinct pointer.
+- An input destructor installed solely as an observation hook ran during handlebars_string_indent, before that function returned. The header describes a new result but does not describe consuming the input reference.
+
+The probes did not free aliases twice or access released input. They establish contract differences, not an experimentally triggered memory-corruption claim.
+
+Give replacement results a consistent ownership rule and document consuming parameters explicitly. Add ownership tests for no-op and empty cases. API names and documentation should make consumption differences between append operations visible to callers.
+
+**Status: addressed.** `handlebars_str_replace` now follows its documented constructor-style contract for every input: the common replacement path returns a distinct allocation under the supplied context even when the input is empty, the search length is zero, or no match exists. The input remains borrowed and unchanged. The header now distinguishes this rule from `handlebars_string_append_str`, which borrows its source, and from both indentation functions, which consume one input reference. The self-alias exception for `handlebars_string_indent_append` and the requirement to use its possibly reallocated return pointer are explicit.
+
+The empty-input and empty-search regressions both initially failed because the result aliased the input. Retained tests now cover matched and unmatched text, empty boundaries, independent cleanup, embedded NUL bytes, search and replacement views into the input, allocator parentage, cached hashes, checked size overflow, allocation failure, ordinary borrowed append sources, both indentation entry points, and full self-aliasing. Fresh Linux verification passed all 3,814 Autotools checks with one expected skip, all 81 string checks under Valgrind, the installed-header check, and the string suite in a no-refcount build. Independent correctness and adversarial reviews found no remaining defect. Reliability verdict: PASS_WITH_RESIDUAL_RISK; binary ABI comparison and non-Linux builds were not run.
+
+### R26. P3: public value contracts and a convenience macro need correction
+
+Sources: [src/handlebars_value.h:317](../../src/handlebars_value.h#L317), [src/handlebars_value.h:335](../../src/handlebars_value.h#L335), [src/handlebars_value.h:424](../../src/handlebars_value.h#L424), [src/handlebars_value.c:298](../../src/handlebars_value.c#L298).
+
+The getter experiments found:
+
+| Documented behavior | Observed behavior |
+| --- | --- |
+| get_strval returns an empty string for non-string values | An integer value returned NULL |
+| get_boolval follows JavaScript boolean conversion | String "0" and an empty native array returned false; NaN returned true |
+
+Either align these functions with their stated contracts or document the actual conversion policy. Avoid quietly changing established truthiness behavior without considering callers.
+
+The convert convenience macro also ends with a semicolon. This ordinary consumer code failed to compile with “else without a previous if”:
+
+~~~c
+if (condition)
+    handlebars_value_convert(value);
+else
+    handlebars_value_null(value);
+~~~
+
+Remove the macro's trailing semicolon, or use a suitable inline wrapper. Header syntax tests alone do not exercise macro composition.
+
+A separate benign state check showed that setting SAFE_STRING, replacing the value with an integer, and then replacing it with a different ordinary string leaves the flag byte equal to one. This is a **potential lifecycle hardening issue**, not an established affected application: define whether flags belong to the payload or the value slot, then reset or preserve them deliberately. No unsafe-content rendering experiment was performed.
+
+**Status: addressed.** The raw string getters now document their actual native-string-only contract: `handlebars_value_get_strval` returns borrowed bytes or NULL, and `handlebars_value_get_strlen` returns the explicit byte length or zero. The boolean getter retains the library's established emptiness rules instead of claiming JavaScript conversion. Its scalar, native-container, and USER count-handler requirements are now explicit. Native string truthiness also uses the stored byte length, so only the exact one-byte string `"0"` is false; an embedded NUL no longer hides a nonempty suffix.
+
+`handlebars_value_convert` is now an expression-safe macro without an embedded semicolon. Flags are defined as metadata for the current payload: replacement, nulling, and destruction clear them, while `handlebars_value_value` copies them with the payload. A rendering regression demonstrated that the old lifecycle let `SAFE_STRING` survive through an integer and suppress escaping on a later ordinary string. The macro composition, stale-flag rendering, and embedded-NUL truthiness regressions all failed before their fixes and are retained alongside raw getter and copy-semantics coverage. Fresh Linux verification passed all 3,818 Autotools checks with one expected skip, all 182 value checks under Valgrind with no definite leaks, all 29 ASan/UBSan CTests, the 166-check no-refcount value suite, and the no-refcount Nix build. Independent correctness review found no remaining defect; non-Linux builds remain unverified.
+
+## CLI and diagnostics
+
+### R27. P2: CLI validation accepts invalid options or silently changes their meaning
+
+Source: [bin/handlebarsc.c:140](../../bin/handlebarsc.c#L140).
+
+Confirmed Release-build results:
+
+| Arguments | Actual |
+| --- | --- |
+| --invalid --version | Printed an option error, then version output, and exited zero |
+| --flags=typo_flag | Rendered successfully with no diagnostic |
+| --flags=not_strict | Enabled strict behavior |
+| --run-count=potato | Rendered successfully |
+| --run-count=2oops | Rendered successfully |
+| --run-count=0 | Still performed a render |
+
+Unknown options fall through an assertion that disappears in Release builds. Flag parsing uses substring matches. Numeric options ignore conversion success and complete-input validation.
+
+Return explicit errors from option parsing. Parse comma-separated flags by exact token, and reuse checked integer parsing like that already used for external-helper limits. Define the zero-run behavior instead of accepting it accidentally.
+
+**Status: addressed.** Unknown options now terminate parsing with a nonzero status, so a later mode such as `--version` cannot turn the invocation into a success. Compiler flags are matched as exact comma-separated names; unknown, partial, whitespace-prefixed, and empty names are rejected without applying any part of that option. A shared strict-decimal parser validates the complete input and target range for run counts, pool sizes, and external-helper limits. Run counts must be positive, while zero remains the documented disable value for the pool and helper limits.
+
+The seven focused CLI cases exercise every supported compiler flag, repeated flags and scalar options, malformed lists, unknown-option ordering, a valid multi-run value, zero, signs, whitespace, trailing text, and overflow. A frozen Release build of the prior revision failed the five negative groups while the exact-name and repetition controls passed, establishing test sensitivity. Fresh Linux verification passed all 123 CLI cases, all 3,823 Autotools checks with one expected skip, all 29 CMake CTests under ASan/UBSan, and the Nix package build. Independent correctness and adversarial test reviews found no remaining defect. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux and 32-bit behavior remain unverified, and impractical maximum-size execution and allocation were not attempted.
+
+### R28. P2: output failure is reported as success
+
+Sources: [bin/handlebarsc.c:876](../../bin/handlebarsc.c#L876), [bin/handlebarsc.c:880](../../bin/handlebarsc.c#L880).
+
+Rendering hello with stdout redirected to /dev/full exited zero and emitted no diagnostic, despite the output sink being unable to accept data.
+
+Check write and final flush errors and propagate failure to the process exit status. Include a failing-output-stream test, including buffered output that fails only at flush time.
+
+**Status: addressed.** All stdout paths now record failed or short writes, and every normal return path explicitly flushes stdout and checks its error indicator. Any failure produces `Failed to write output` on stderr and forces a nonzero exit status. Writes and flushes temporarily ignore `SIGPIPE` so a closed pipe is reported through the same path, then restore the caller's disposition before other work can observe it. This covers formatted help and version output as well as binary lex, parse, compile, module, and render output; lexing retains its per-token flush behavior.
+
+Both retained `/dev/full` regressions failed against the prior executable: a five-byte render buffered until process shutdown, and a 64 KiB render failed during its direct write, yet each exited zero without a diagnostic. The expanded suite covers every output-producing mode, a downstream pipe reader that exits early, zero-length output, both default and inherited ignored `SIGPIPE` dispositions, and initially closed standard descriptors. Fresh Linux verification passed all 129 CLI cases, all 3,829 Autotools checks with one expected skip, all 29 CMake CTests under ASan/UBSan, and the Nix package build. Independent correctness and adversarial test reviews found no remaining defect. Reliability verdict: PASS; behavior on platforms without `SIGPIPE` or `/dev/full` was reviewed statically but not executed.
+
+### R29. P3: diagnostic locations depend on preceding text, and copies truncate silently
+
+Sources: [src/handlebars.l:88](../../src/handlebars.l#L88), [src/handlebars.c:139](../../src/handlebars.c#L139), [src/handlebars.c:166](../../src/handlebars.c#L166).
+
+The same syntax error on line two was reported at different columns:
+
+| Template bytes | Reported location |
+| --- | --- |
+| a\n{{) }} | Line 2, column 6 |
+| abcdefghij\n{{) }} | Line 2, column 15 |
+
+Lexer column accounting adds the whole token length after newline handling, carrying preceding-line length into the next line.
+
+Separately, a 600-character ordinary error message remained 600 characters through handlebars_error_msg, but the copied diagnostic APIs returned lengths 255 and 511. The fixed formatting buffers silently truncate the message, and the normal form can lose its location suffix.
+
+Track positions relative to the last newline. Allocate formatted diagnostics to the required length, or explicitly report truncation. Test locations with different preceding-line lengths and long messages whose distinguishing information is near the end.
+
+**Status: addressed.** Lexer column accounting now derives the next column from the bytes after the final newline in each matched token. Scanner pushback also restores the column before those bytes are rescanned, so diagnostic columns are source offsets rather than counts of internal lexer passes. The ordinary and JavaScript-compatible diagnostic-copy APIs now allocate their formatted results to the required length instead of using fixed 256- and 512-byte buffers.
+
+The initial regressions reproduced line-two columns 6 and 15 for identical errors after one- and ten-byte preceding lines, and reproduced copied diagnostic lengths of 255 and 511 for a 600-byte message. They now report the actual zero-based column 2 and preserve the complete 622- and 636-byte formatted messages, including distinguishing text at the end. Independent testing also found that pushback made a bare error report column 4 and a six-byte comment move the same error to column 15; those cases now report source columns 2 and 8. Additional probes covered CRLF input, an escaped mustache, and a multiline comment.
+
+Fresh Linux verification passed all 34 focused context and parser checks, all 79 parser-spec and 78 tokenizer-spec checks, all 116 compiler checks, 3,832 of 3,833 Autotools checks with one expected skip, and all 29 CMake tests under ASan/UBSan with allocation-failure testing enabled and LeakSanitizer disabled. The Nix package build also passed. Independent correctness and adversarial test reviews found the pushback defect during the first reliability pass; the retained regression and final review passed after the fix. Reliability verdict: PASS_WITH_RESIDUAL_RISK; non-Linux platforms were not run.
+
+### R30. P3: opcode utility APIs do not honor their advertised mappings or flags
+
+Sources: [src/handlebars_opcodes.c:274](../../src/handlebars_opcodes.c#L274), [src/handlebars_opcode_printer.c:183](../../src/handlebars_opcode_printer.c#L183).
+
+Two direct API probes found:
+
+- The valid return opcode mapped from enum value 27 to the name return, but reverse mapping returned -1.
+- Printing the same program with and without handlebars_opcode_printer_flag_no_newlines produced identical output containing a newline.
+
+**Status: addressed.** The reverse mapper now recognizes return. The existing opcode-name test checks both directions for all 28 valid opcode types and the invalid sentinel, including the previously untested lookupBlockParam, registerDecorator, and return names. Before the fix, the return assertion failed with -1 instead of 27.
+
+Program printing now honors no_newlines for the separators after opcodes, program boundaries, and decorator headings. It uses spaces while preserving indentation and operand content. New tests cover default and compact output for child and decorator programs, empty programs, and combining the flag with location output. A string operand containing a newline retains its escaped representation. All three separator tests failed before the fix and pass afterward.
+
+Independent correctness and test reviews found no actionable defects in R07 or R30. The test review strengthened the recursive separator test to include a nonempty decorator program. Fresh final Linux verification passed all 29 CTest programs in Release and Debug ASan/UBSan builds with allocation-failure testing enabled. The memory-disabled Autotools build and distcheck each passed all 2,309 checks. Focused Debug suites also passed. Six CLI checks across Release and Debug printed inline, nested, and forward partial declarations with their registration markers intact. Markdown lint passed. Reliability verdict: PASS_WITH_RESIDUAL_RISK; hosted CI and non-Linux builds remain unverified.
+
+## Test comprehensiveness and dependency maintenance
+
+### R31. P2: three specification runners omit their final fixture
+
+Sources: [tests/test_spec_handlebars_compiler.c:728](../../tests/test_spec_handlebars_compiler.c#L728), [tests/test_spec_handlebars_parser.c:280](../../tests/test_spec_handlebars_parser.c#L280), [tests/test_spec_handlebars_tokenizer.c:250](../../tests/test_spec_handlebars_tokenizer.c#L250).
+
+At the reviewed commit, each runner supplied tests_len - 1 as the exclusive loop-test end.
+
+Fresh baseline logs reported:
+
+| Runner | Loaded | Executed |
+| --- | --- | --- |
+| Compiler | 461 | 460 |
+| Parser | 79 | 78 |
+| Tokenizer | 78 | 77 |
+
+For a stronger control, a temporary copy of the compiler exports changed the last fixture's expected appendContent operand to REVIEW_SENTINEL. All 460 checks still passed. Moving that same modified fixture one position earlier produced one failure.
+
+**Status: addressed.** All three runners now use tests_len as the exclusive end. Fresh full runs loaded and executed 461 compiler, 79 parser, and 78 tokenizer fixtures, with no failures. The formerly omitted parser fixture, “should fail if directives have inverse,” and the final “tokenizes raw blocks” tokenizer fixture both pass.
+
+The new [tests/test_spec_runners.sh](../../tests/test_spec_runners.sh) invokes the actual runners with independent, minimal fixtures. For each runner, it checks that a singleton executes exactly once, then adds a deliberately incorrect final fixture and requires exactly two checks with one failure identifying that fixture. Before the fix, all six checks failed: singleton inputs ran zero checks, and incorrect final fixtures were omitted. All six pass after the fix.
+
+### R32. P2: a missing runtime fixture file silently reduces coverage
+
+Source: [tests/test_spec_handlebars.c:597](../../tests/test_spec_handlebars.c#L597).
+
+Removing only whitespace-control.json from a temporary fixture directory produced:
+
+~~~text
+Failed to read spec file: .../whitespace-control.json
+Loaded 413 test cases
+Handlebars spec exclusions: 11 runtime, 40 AST-inapplicable
+100%: Checks: 776, Failures: 0, Errors: 0
+~~~
+
+The process exited zero. The baseline loaded 449 fixtures and executed 848 checks, so 72 checks disappeared while the exclusion budget remained satisfied.
+
+**Status: addressed.** The runtime runner now checks every load result for its ten required fixture files and exits unsuccessfully before starting Check when any load fails. JSON parse errors detected by the existing loader and non-array roots also stop the run, with diagnostics identifying the file. The required file inventory and existing runtime/AST exclusion budgets are unchanged.
+
+The runner regression script starts with a complete fixture copy, then removes each required file separately and requires failure before test execution. It also checks an incomplete JSON document and a non-array root. Before the fix, all twelve negative cases failed these assertions; whitespace-control.json omissions and these invalid contents still produced successful runs. Independent test review added an unreadable-file check and a stronger TEST_NUM selection assertion. The complete 20-case script passes, including the R31 cases and the successful startup control. The permission check skips explicitly if the current user can still read the restricted file. The script clears inherited Check selection/logging overrides and modifies only temporary fixture copies.
+
+CTest runs the script on Unix platforms, and Autotools runs it when JSON support enables these specification runners. The script is distributed in release archives and uses the existing executables and standard shell tools. Fresh Linux verification passed all 29 CTest programs in Release and Debug ASan/UBSan builds, both with allocation-failure testing enabled. The memory-disabled Autotools build and distcheck each passed 2,304 checks. An extracted archive passed all five affected CTest tests. The script also passed with read-only source fixtures, temporary paths containing spaces, and a reordered valid fixture set whose first case expects an error. ShellCheck and shell syntax validation passed.
+
+**Follow-up status: addressed.** All four JSON fixture loaders now use one
+length-delimited test utility that requires json-c to consume the complete
+document, apart from trailing JSON whitespace. Before the fix, the compiler,
+parser, tokenizer, and runtime runners each accepted a second JSON value after
+their fixture array and started Check. The retained runner regression requires
+all four to reject that input before running tests, while the existing
+newline-terminated controls continue to pass. Inputs larger than json-c's
+signed-length limit are also rejected.
+
+Independent review found that the first helper version rejected exact-length
+scalars and json-c line comments ending at EOF because json-c requested one more
+byte. The helper now supplies a separate virtual terminator only after the
+parser consumes the supplied boundary. Focused controls cover exact scalars,
+JSON whitespace, comments, extra values, ordinary suffixes, non-JSON whitespace,
+embedded NULs, and the signed-length limit. Fresh final verification passed all
+3,837 Autotools checks with one expected skip, the utility suite under Valgrind
+with no errors or leaks, and all ten x86_64-linux flake checks. Reliability
+verdict: PASS_WITH_RESIDUAL_RISK. Other json-c versions and non-Linux platforms
+remain unverified.
+
+### R33. P2: floating-point tests discard fractional precision
+
+Sources: [tests/test_json.c:91](../../tests/test_json.c#L91), [tests/test_yaml.c:109](../../tests/test_yaml.c#L109), [tests/test_value.c:2599](../../tests/test_value.c#L2599).
+
+At the reviewed commit, these tests compared fractional values using ck_assert_int_eq. Check 0.15.2 converts the operands to integers.
+
+A standalone Check control using ck_assert_int_eq(1234.0, 1234.4321) passed. The same values compared with ck_assert_double_eq_tol and a tolerance of 0.000001 failed.
+
+**Status: addressed.** The three existing tests now use ck_assert_double_eq_tol with an absolute tolerance of 0.000001. This allows conversion rounding while still detecting changes in any of the fixture's four decimal places.
+
+Temporary builds changed each expected value from 1234.4321 to 1234.9876, leaving the actual value unchanged. All three original integer assertions passed despite the different fractions; each corrected assertion failed. Restoring the expected values made all three focused tests pass.
+
+### R34. P2: the token-print allocation-failure test never attempts the operation
+
+Source: [tests/test_token.c:266](../../tests/test_token.c#L266).
+
+The first setjmp return is zero. At the reviewed commit, the test negated it and immediately returned, before enabling failure injection or calling token_print.
+
+A temporary instrumented copy, linked to the sanitizer/memory-testing build, ran the isolated test and reported one passing check. It printed a marker in the early-return branch and never printed the marker immediately before enabling injection.
+
+**Status: addressed.** The test now reaches token printing on the initial setjmp return and handles the subsequent allocation error. Injection is restricted to allocations. The error branch disables injection before cleanup, requires HANDLEBARS_NOMEM and a positive allocation-call count, destroys the token, clears the intentional error, and checks that context allocations return to their starting count. An unexpected successful return fails with an explicit diagnostic.
+
+Adding the error assertions before correcting the branch produced a focused failure: the context still reported HANDLEBARS_SUCCESS. The corrected test passes. Separate temporary controls that omitted injection, omitted the print call, or omitted token cleanup each failed the intended assertion. Restoring the test made the focused check pass again.
+
+Fresh Linux verification for R33–R34 passed all 29 CTest programs in Release and Debug ASan/UBSan builds with allocation-failure testing enabled. The memory-disabled Autotools build and distcheck each passed all 2,304 checks. The four focused tests and Markdown lint also passed. Non-Linux builds remain unverified.
+
+### R35. P3: bundled XXH3 hashing depends on update partitioning
+
+Sources: [vendor/xxhash/xxh3.h:1598](../../vendor/xxhash/xxh3.h#L1598), [vendor/xxhash/xxh3.h:1652](../../vendor/xxhash/xxh3.h#L1652), [src/handlebars_string.c:172](../../src/handlebars_string.c#L172).
+
+The bundled header documents streaming equivalence to its one-shot operation. A dependency-only probe hashed ordinary alphabetic patterned data using one-shot, one update, and one-byte updates.
+
+For 257 bytes:
+
+~~~text
+one-shot:       973507107031e78f
+one update:     7b30fb4e88faab9d
+one-byte calls: 973507107031e78f
+~~~
+
+Lengths 300 and 513 also disagreed. Controls at 256, 320, and 512 agreed.
+
+The project uses the one-update streaming path for string hashing. This experiment demonstrates an algorithm-equivalence defect, not a cryptographic or collision-security claim. The project's consistent use of one update can hide the dependency inconsistency.
+
+Do not patch the vendored implementation locally. Consider updating to a newer upstream release, with equivalence tests across chunk boundaries. Consider persisted hash/cache compatibility when changing the algorithm.
+
+**Status: addressed.** The vendored xxHash implementation was updated as a unit
+from 0.7.3 to 0.8.3, the current upstream release. The project now uses the
+one-shot XXH3 interface directly. A regression compares it with streaming
+hashes across 40 boundary lengths through 2,049 bytes, 30 fixed update sizes,
+zero-length updates, and 32 deterministic nonuniform partitions per length;
+all 2,480 streaming comparisons produce the same value.
+
+XXH3 was still unstable in xxHash 0.7.3, so this update intentionally changes
+some hash values. Serialized modules include an XXH3 checksum. Verification
+recomputes that checksum before a persistent cache entry is accepted, causing
+modules written with the old algorithm to be rejected and recompiled rather
+than reused. A cross-version probe normalized a valid 3,440-byte module and
+confirmed that verification accepted its 0.8.3 checksum, then rejected the
+checksum produced by the exact previous 0.7.3 one-update path.
+
+Fresh verification reported 3,833 Autotools passes and one expected skip, all
+29 GCC CTest programs, all 29 Clang 21 AddressSanitizer and UndefinedBehaviorSanitizer
+CTest programs with leak detection disabled, and all ten x86_64-linux flake
+checks. Non-x86, big-endian, and 32-bit platforms remain unverified.
+
+### R36. P2: a third nested each retains its data frame after an allocation failure
+
+Sources: [src/handlebars_helpers.c:167](../../src/handlebars_helpers.c#L167), [src/handlebars_vm.c:1903](../../src/handlebars_vm.c#L1903).
+
+An allocation-failure probe rendered this template repeatedly with a reusable VM, failing each successive allocation:
+
+~~~handlebars
+{{#each outer}}{{#each this}}{{#each this}}x{{/each}}{{/each}}{{/each}}
+~~~
+
+Single- and double-nested controls exhausted the same injection range without retaining VM allocations. At the reviewed revision, the third nested block failed at allocation 20 and left eight VM-owned blocks instead of the three-block baseline. A talloc tree showed one 288-byte data-frame map and four strings. A debugger located the failed allocation in `accept_empty_hash` while entering the innermost helper. Context destruction eventually releases these allocations, but reusing the VM after this error retains them for its remaining lifetime.
+
+Add the three-level case to the existing helper allocation-failure loop, then ensure program execution releases its saved data reference if a nested call fails before normal cleanup.
+
+**Status: addressed.** Program execution now keeps cleanup state outside the `longjmp` target and uses the existing VM call checkpoint to restore stacks, buffer, data, and depth before rethrowing an error. The three-level case is part of the allocation-failure loop and returns to the three-block VM baseline after every injected failure. An additional direct-call regression catches a failing nested program inside a helper, verifies the complete boundary state, continues the outer render, and repeats the render on the same VM.
+
+## Improvements supported by these results
+
+The useful cleanup work follows from the defects above:
+
+- Put build features and versions in one authoritative representation, then test installed consumers and extracted source archives.
+- Reduce duplicated opcode and inline-partial inference. Explicit metadata is easier to validate than multiple scanners trying to rediscover declaration boundaries.
+- Separate format selection, parse status, value truthiness, membership, and ownership. Several defects result from using one of these concepts as a proxy for another.
+- Add native/lazy representation parity tests and render-equivalence AST tests.
+- Exercise debug diagnostics as well as Release rendering.
+- Measure retained allocations during VM reuse, in addition to checking eventual cleanup.
+- Validate test selection and assertion sensitivity, not only a successful test-process exit.
+
+The code already has substantial ownership, error-boundary, cache, API-header, sanitizer, and allocation-failure coverage. The experiments show where that coverage does not yet establish the claimed behavior.
+
+No style-only changes are recommended without a concrete maintenance benefit. In particular, a passing local test with a weak assertion was not treated as proof that the entire suite lacks coverage.
+
+## Unresolved questions and rejected broader claims
+
+These were not promoted to experimentally confirmed findings:
+
+- Ordinary-mode partial rendering remained allocation-stable. The retained-memory finding is restricted to the tested compatibility path.
+- Strict-mode behavior changed correctly with a warmed cache. R08 uses the separately confirmed compilation/escaping flag case.
+- Partial-block trim markers disappeared during AST reconstruction, but the original renderer already ignored their effect. This was not counted as a second demonstrated rendering change.
+- Explicit YAML tags, string-literal backslash reconstruction, sparse-iterator completion assertions, and compiler allocation loops need additional focused controls before separate findings are justified.
+- Very-large-input integer bounds, formatting cleanup across allocation failure, alternative pthread mutex setup, read-only cache/string contracts, custom iterator unwinding, and mmap reset/release latency remain source-review follow-ups. No special triggering inputs, exploitability results, or platform validation are claimed.
+- The lexer reallocates its token-pointer array for every token, but no performance experiment established the practical cost. A growth-policy change should be benchmarked before being recommended as a measured improvement.
+
+## Reproduction notes and retained evidence
+
+CLI examples can be run from a configured checkout, for example:
+
+~~~sh
+printf '%s' '{{#if 0.0}}T{{else}}F{{/if}}' |
+    ./bin/handlebarsc --no-newline -
+~~~
+
+For examples with data, write the table's JSON or YAML to a temporary file and pass --data with that filename. Filename-length experiments require using the short relative names exactly. C API probes used fresh contexts, valid modules produced by the project's compiler, and balanced returned-output releases unless testing an explicitly described ownership observation.
+
+The local experiment directory is /tmp/handlebars-project-review/. It contains the probe sources and measured outputs, including:
+
+- api-probe.c, api-results.txt, and api-results-compat.txt for conversion, cache contracts/settings, and allocation retention.
+- contracts-probe.c, contracts-results.txt, macro-probe.c, and macro-results.txt.
+- ast-probe.c and ast-results.txt.
+- utility-probe.c, utility-results.txt, hash-probe.c, and hash-results.txt.
+- float-assert-probe.c, float-assert-results.txt, token-test-reachability.txt, and test-gap-results.json.
+- cli/ JSON result files with exact inputs, stdout, stderr, and statuses.
+- CMake build, installation, consumer, optional-dependency, and debug-module logs.
+- asan-build.log, asan-tests.log, distcheck.log, dist-control.log, and archive-inspection.txt.
+
+The baseline log is /tmp/handlebars-review-baseline.log.
+
+Raw review artifacts are under /tmp/handlebars-project-review/.c-review-results/20260904/: findings.json, REPORT.md, REPORT.sarif, units.json, ledger-gate.json, parts/, and assignments/. They retain rejected coverage accounting and unverified candidates. They are local working artifacts, not additional confirmed findings, and may be removed by temporary-directory cleanup.
+
+All confirmed observations and their interpretation are included above so the report remains useful after those temporary artifacts disappear.

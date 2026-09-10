@@ -20,6 +20,8 @@
 #endif
 
 #include <assert.h>
+#include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -54,6 +56,22 @@ enum cache_copy_module_result {
     cache_copy_module_nomem
 };
 
+static enum cache_copy_module_result cache_verify_module(
+    struct handlebars_module * module,
+    size_t module_size
+) {
+    /* module verification allocates its opcode ownership table with calloc.
+     * Preserve allocation failure instead of classifying a valid record as
+     * corrupt and eligible for replacement. */
+    errno = 0;
+    if( handlebars_module_verify_ex(module, module_size, NULL) ) {
+        return cache_copy_module_valid;
+    }
+    return errno == ENOMEM
+        ? cache_copy_module_nomem
+        : cache_copy_module_invalid;
+}
+
 
 #undef CONTEXT
 #define CONTEXT HBSCTX(cache)
@@ -68,28 +86,34 @@ static int cache_dtor(struct handlebars_cache * cache)
     return 0;
 }
 
+static bool cache_module_size(const MDB_val * data, size_t * module_size)
+{
+    if( unlikely(data->mv_size < sizeof(struct handlebars_module)) ) {
+        return false;
+    }
+    memcpy(
+        module_size,
+        (const unsigned char *) data->mv_data
+            + offsetof(struct handlebars_module, size),
+        sizeof(*module_size)
+    );
+    return *module_size == data->mv_size;
+}
+
 static enum cache_copy_module_result cache_copy_module(
     struct handlebars_cache * cache,
     const MDB_val * data,
     struct handlebars_module ** result
 ) {
     struct handlebars_module * module;
+    enum cache_copy_module_result verify_result;
     size_t module_size;
 
     *result = NULL;
 
-    if( unlikely(data->mv_size < sizeof(struct handlebars_module)) ) {
-        return cache_copy_module_invalid;
-    }
-
     /* LMDB only promises byte-addressable value storage. Read the claimed
      * size without first casting the database memory to an aligned module. */
-    memcpy(
-        &module_size,
-        (const unsigned char *) data->mv_data + offsetof(struct handlebars_module, size),
-        sizeof(module_size)
-    );
-    if( unlikely(module_size != data->mv_size) ) {
+    if( unlikely(!cache_module_size(data, &module_size)) ) {
         return cache_copy_module_invalid;
     }
 
@@ -100,12 +124,41 @@ static enum cache_copy_module_result cache_copy_module(
     talloc_set_type(module, struct handlebars_module);
     memcpy(module, data->mv_data, module_size);
 
-    if( unlikely(!handlebars_module_verify_ex(module, module_size, NULL)) ) {
+    verify_result = cache_verify_module(module, module_size);
+    if( unlikely(verify_result != cache_copy_module_valid) ) {
         handlebars_talloc_free(module);
-        return cache_copy_module_invalid;
+        return verify_result;
     }
 
     *result = module;
+    return cache_copy_module_valid;
+}
+
+static enum cache_copy_module_result cache_validate_module(
+    const MDB_val * data,
+    time_t * timestamp
+) {
+    struct handlebars_module * module;
+    enum cache_copy_module_result verify_result;
+    size_t module_size;
+
+    if( unlikely(!cache_module_size(data, &module_size)) ) {
+        return cache_copy_module_invalid;
+    }
+
+    /* LMDB values need not satisfy the module's alignment requirements. */
+    module = malloc(module_size);
+    if( unlikely(module == NULL) ) {
+        return cache_copy_module_nomem;
+    }
+    memcpy(module, data->mv_data, module_size);
+    verify_result = cache_verify_module(module, module_size);
+    if( unlikely(verify_result != cache_copy_module_valid) ) {
+        free(module);
+        return verify_result;
+    }
+    *timestamp = module->ts;
+    free(module);
     return cache_copy_module_valid;
 }
 
@@ -213,7 +266,8 @@ static struct handlebars_module * cache_find(struct handlebars_cache * cache, st
 
     // Make key
     key.mv_size = hbs_str_len(tmpl) + 1;
-    key.mv_data = hbs_str_val(tmpl);
+    /* LMDB does not modify key bytes despite MDB_val using void *. */
+    key.mv_data = (void *) hbs_str_val(tmpl);
 
     // Fetch data
     err = mdb_get(txn, dbi, &key, &data);
@@ -272,7 +326,11 @@ static void cache_add(
     MDB_dbi dbi;
     MDB_val key;
     MDB_val data;
-    struct handlebars_module * module_copy;
+    struct handlebars_module * module_copy = NULL;
+    enum cache_copy_module_result copy_result;
+    unsigned int put_flags = MDB_NOOVERWRITE;
+    time_t existing_timestamp;
+    time_t now;
 
     // LMDB cannot store keys beyond this limit. Do not reduce long templates
     // to a non-unique hash key, since that can return another template's module.
@@ -280,18 +338,8 @@ static void cache_add(
         return;
     }
 
-    // Normalize a private copy before taking the LMDB write lock.
-    module_copy = handlebars_talloc_size(CONTEXT, module->size);
-    HANDLEBARS_MEMCHECK(module_copy, CONTEXT);
-    talloc_set_type(module_copy, struct handlebars_module);
-    memcpy(module_copy, module, module->size);
-    handlebars_module_patch_pointers(module_copy);
-    handlebars_module_normalize_pointers(module_copy, (void *) 0);
-    handlebars_module_generate_hash(module_copy);
-
     err = mdb_txn_begin(intern->env, NULL, 0, &txn);
     if( unlikely(err != 0) ) {
-        handlebars_talloc_free(module_copy);
         HANDLE_RC(err);
         return;
     }
@@ -301,14 +349,54 @@ static void cache_add(
 
     // Make key
     key.mv_size = hbs_str_len(tmpl) + 1;
-    key.mv_data = hbs_str_val(tmpl);
+    /* LMDB does not modify key bytes despite MDB_val using void *. */
+    key.mv_data = (void *) hbs_str_val(tmpl);
+
+    // Keep valid entries immutable, but allow a miss caused by an invalid or
+    // expired record to refresh that key. The write transaction makes the
+    // decision and replacement atomic with respect to other writers.
+    err = mdb_get(txn, dbi, &key, &data);
+    if( err == 0 ) {
+        copy_result = cache_validate_module(&data, &existing_timestamp);
+        if( unlikely(copy_result == cache_copy_module_nomem) ) {
+            mdb_txn_abort(txn);
+            handlebars_throw(CONTEXT, HANDLEBARS_NOMEM, HANDLEBARS_MEMCHECK_MSG);
+            return;
+        }
+        if( copy_result == cache_copy_module_valid ) {
+            time(&now);
+            if( cache->max_age < 0
+                    || difftime(now, existing_timestamp) < cache->max_age ) {
+                goto duplicate;
+            }
+        }
+        put_flags = 0;
+    } else if( unlikely(err != MDB_NOTFOUND) ) {
+        goto error;
+    }
+
+    module_copy = handlebars_talloc_size(CONTEXT, module->size);
+    if( unlikely(!module_copy) ) {
+        mdb_txn_abort(txn);
+        handlebars_throw(CONTEXT, HANDLEBARS_NOMEM, HANDLEBARS_MEMCHECK_MSG);
+        return;
+    }
+    talloc_set_type(module_copy, struct handlebars_module);
+    memcpy(module_copy, module, module->size);
+    handlebars_module_patch_pointers(module_copy);
+    handlebars_module_normalize_pointers(module_copy, (void *) 0);
+    handlebars_module_generate_hash(module_copy);
 
     // Make data
     data.mv_size = module_copy->size;
     data.mv_data = module_copy;
 
     // Store
-    err = mdb_put(txn, dbi, &key, &data, 0);
+    err = mdb_put(txn, dbi, &key, &data, put_flags);
+    if( unlikely(err == MDB_KEYEXIST) ) {
+        handlebars_talloc_free(module_copy);
+        goto duplicate;
+    }
     if( unlikely(err != 0) ) goto error;
     handlebars_talloc_free(module_copy);
 
@@ -318,8 +406,13 @@ static void cache_add(
 
     return;
 
+duplicate:
+    mdb_txn_abort(txn);
+    handlebars_throw(CONTEXT, HANDLEBARS_ERROR, "Duplicate cache key");
+    return;
+
 error:
-    handlebars_talloc_free(module_copy);
+    if( module_copy ) handlebars_talloc_free(module_copy);
     mdb_txn_abort(txn);
     HANDLE_RC(err);
 }
@@ -346,7 +439,7 @@ static struct handlebars_cache_stat cache_stat(struct handlebars_cache * cache)
     err = mdb_stat(txn, dbi, &stat);
     if( unlikely(err != 0) ) goto error;
 
-    intern->stat.name = "mmap";
+    intern->stat.name = "lmdb";
     intern->stat.current_entries = stat.ms_entries;
 
 error:
@@ -393,12 +486,20 @@ static const struct handlebars_cache_handlers hbs_cache_handlers_lmdb = {
     &cache_reset
 };
 
-struct handlebars_cache * handlebars_cache_lmdb_ctor(
+struct handlebars_cache_lmdb_ctor_state {
+    struct handlebars_cache * cache;
+};
+
+static void handlebars_cache_lmdb_ctor_init(
     struct handlebars_context * context,
-    const char * path
+    const char * path,
+    struct handlebars_cache_lmdb_ctor_state * state
 ) {
+    int err;
     struct handlebars_cache * cache = handlebars_talloc_zero_size(context, sizeof(struct handlebars_cache) + sizeof(struct handlebars_cache_lmdb));
+
     HANDLEBARS_MEMCHECK(cache, context);
+    state->cache = cache;
     talloc_set_type(cache, struct handlebars_cache);
     handlebars_context_bind(context, HBSCTX(cache));
 
@@ -408,11 +509,76 @@ struct handlebars_cache * handlebars_cache_lmdb_ctor(
     struct handlebars_cache_lmdb * intern = (void *) ((char *) cache + sizeof(struct handlebars_cache));
     cache->internal = intern;
 
-    mdb_env_create(&intern->env);
+    err = mdb_env_create(&intern->env);
+    HANDLE_RC(err);
     talloc_set_destructor(cache, cache_dtor);
 
-    int err = mdb_env_open(intern->env, path, MDB_WRITEMAP | MDB_MAPASYNC | MDB_NOSUBDIR, 0644);
+    // LMDB 1.0.1 can abort when GC commits deletions with MDB_WRITEMAP.
+    // Use the default write mode and synchronous commits on all versions.
+    err = mdb_env_open(intern->env, path, MDB_NOSUBDIR, 0644);
     HANDLE_RC(err);
+}
 
-    return cache;
+struct handlebars_cache * handlebars_cache_lmdb_ctor(
+    struct handlebars_context * context,
+    const char * path
+) {
+    struct handlebars_cache_lmdb_ctor_state state = {0};
+
+    handlebars_cache_lmdb_ctor_init(context, path, &state);
+    return state.cache;
+}
+
+HBS_ATTR_NOINLINE
+static enum handlebars_error_type handlebars_cache_lmdb_ctor_try_guarded(
+    struct handlebars_context * context,
+    const char * path,
+    struct handlebars_cache_lmdb_ctor_state * state
+) {
+    struct handlebars_error * error = context->e;
+    jmp_buf * volatile previous = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(context, &buf) ) {
+        caught = error->num;
+        if( state->cache != NULL ) {
+            handlebars_cache_dtor(state->cache);
+            state->cache = NULL;
+        }
+    } else {
+        handlebars_cache_lmdb_ctor_init(context, path, state);
+    }
+
+    error->jmp = previous;
+    return caught;
+}
+
+enum handlebars_error_type handlebars_cache_lmdb_ctor_try(
+    struct handlebars_context * context,
+    const char * path,
+    struct handlebars_cache ** result
+) {
+    struct handlebars_cache_lmdb_ctor_state state = {0};
+    struct handlebars_cache_try_guard guard;
+    enum handlebars_error_type error;
+    enum handlebars_error_type guard_error;
+
+    *result = NULL;
+    error = handlebars_cache_try_guard_begin(context->e, &guard);
+    if( error != HANDLEBARS_SUCCESS ) {
+        return error;
+    }
+    handlebars_error_clear(context);
+    error = handlebars_cache_lmdb_ctor_try_guarded(context, path, &state);
+    guard_error = handlebars_cache_try_guard_end(&guard);
+    if( error == HANDLEBARS_SUCCESS ) {
+        error = guard_error;
+    }
+    if( error == HANDLEBARS_SUCCESS ) {
+        *result = state.cache;
+    } else if( state.cache != NULL ) {
+        handlebars_cache_dtor(state.cache);
+    }
+    return error;
 }

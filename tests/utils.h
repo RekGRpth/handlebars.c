@@ -44,6 +44,17 @@
 	tcase_add_test(tc_ ## name, name); \
 	suite_add_tcase(s, tc_ ## name);
 
+#ifdef HANDLEBARS_MEMORY
+#define REGISTER_MEMORY_TEST_FIXTURE(s, name, title) REGISTER_TEST_FIXTURE(s, name, title)
+#else
+#define REGISTER_MEMORY_TEST_FIXTURE(s, name, title) \
+    do { \
+        (void) (s); \
+        (void) (name); \
+        (void) (title); \
+    } while (0)
+#endif
+
 #define _ck_assert_str_msg(X, OP, Y, msg) do { \
 	const char* _ck_x = (X); \
 	const char* _ck_y = (Y); \
@@ -108,6 +119,7 @@ struct hbs_test_json_holder {
 };
 
 int hbs_test_json_dtor(struct hbs_test_json_holder * holder);
+struct json_object * hbs_test_json_parse_document(const char * data, size_t length);
 
 #define HBS_TEST_JSON_DTOR(ctx, o) \
     do { \
@@ -128,6 +140,9 @@ extern struct handlebars_vm * vm;
 extern size_t init_blocks;
 void default_setup(void);
 void default_teardown(void);
+void clear_intentional_error(void);
+char * activate_comma_decimal_locale(void);
+void restore_numeric_locale(char * saved_locale);
 typedef Suite * (*suite_ctor_func)(void);
 int default_main(suite_ctor_func suite_ctor);
 

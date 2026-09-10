@@ -31,6 +31,7 @@
 
 #include "handlebars_ast.h"
 #include "handlebars_ast_list.h"
+#include "handlebars_compiler.h"
 #include "handlebars_memory.h"
 #include "handlebars_parser.h"
 #include "handlebars_parser_private.h"
@@ -203,7 +204,7 @@ static inline void handlebars_whitespace_accept_program(struct handlebars_parser
     struct handlebars_ast_list * statements = program->node.program.statements;
     struct handlebars_ast_list_item * item;
     struct handlebars_ast_list_item * tmp;
-    bool do_standalone = true; //!(parser->flags & handlebars_compiler_flag_ignore_standalone);
+    bool do_standalone = !(parser->flags & handlebars_compiler_flag_ignore_standalone);
 
     parser->whitespace_root_seen = 1;
 
@@ -242,8 +243,8 @@ static inline void handlebars_whitespace_accept_program(struct handlebars_parser
                 if( current->type == HANDLEBARS_AST_NODE_PARTIAL &&
                         prev && prev->type == HANDLEBARS_AST_NODE_CONTENT ) {
                     struct handlebars_string * start = prev->node.content.original;
-                    char * ptr;
-                    char * match = NULL;
+                    const char * ptr;
+                    const char * match = NULL;
                     for( ptr = hbs_str_val(start); *ptr; ++ptr ) {
                         if( *ptr == ' ' || *ptr == '\t' ) {
                             if( !match ) {
@@ -254,13 +255,17 @@ static inline void handlebars_whitespace_accept_program(struct handlebars_parser
                         }
                     }
                     if( match ) {
-                        current->node.partial.indent = handlebars_string_ctor(CONTEXT, match, strlen(match));
+                        current->node.partial.indent = talloc_steal(
+                            current,
+                            handlebars_string_ctor(CONTEXT, match, strlen(match))
+                        );
                     }
                 }
             }
         }
         if( do_standalone && open_standalone ) {
-            if( current->type == HANDLEBARS_AST_NODE_BLOCK ) {
+            if( current->type == HANDLEBARS_AST_NODE_BLOCK ||
+                    current->type == HANDLEBARS_AST_NODE_PARTIAL_BLOCK ) {
                 if( current->node.block.program ) {
                     assert(current->node.block.program->type == HANDLEBARS_AST_NODE_PROGRAM);
                     handlebars_whitespace_omit_right(current->node.block.program->node.program.statements, NULL, 0);
@@ -273,7 +278,8 @@ static inline void handlebars_whitespace_accept_program(struct handlebars_parser
         }
         if( do_standalone && close_standalone ) {
             handlebars_whitespace_omit_right(statements, current, 0);
-            if( current->type == HANDLEBARS_AST_NODE_BLOCK ) {
+            if( current->type == HANDLEBARS_AST_NODE_BLOCK ||
+                    current->type == HANDLEBARS_AST_NODE_PARTIAL_BLOCK ) {
                 if( current->node.block.inverse ) {
                     assert(current->node.block.inverse->type == HANDLEBARS_AST_NODE_PROGRAM);
                     handlebars_whitespace_omit_left(current->node.block.inverse->node.program.statements, NULL, 0);
@@ -319,7 +325,7 @@ static inline void handlebars_whitespace_accept_block(struct handlebars_parser *
     struct handlebars_ast_node * firstInverse;
     struct handlebars_ast_node * lastInverse;
     unsigned strip = 0;
-    bool do_standalone = true; //!(parser->flags & handlebars_compiler_flag_ignore_standalone);
+    bool do_standalone = !(parser->flags & handlebars_compiler_flag_ignore_standalone);
 
     if( block->node.block.program ) {
         handlebars_whitespace_accept(parser, block->node.block.program);
@@ -495,6 +501,7 @@ void handlebars_whitespace_accept(struct handlebars_parser * parser,
 
     switch( node->type ) {
         case HANDLEBARS_AST_NODE_BLOCK:
+        case HANDLEBARS_AST_NODE_PARTIAL_BLOCK:
             return handlebars_whitespace_accept_block(parser, node);
         case HANDLEBARS_AST_NODE_MUSTACHE:
             return handlebars_whitespace_accept_mustache(parser, node);
@@ -513,7 +520,6 @@ void handlebars_whitespace_accept(struct handlebars_parser * parser,
         case HANDLEBARS_AST_NODE_CONTENT:
         case HANDLEBARS_AST_NODE_HASH:
         case HANDLEBARS_AST_NODE_HASH_PAIR:
-        case HANDLEBARS_AST_NODE_PARTIAL_BLOCK:
         case HANDLEBARS_AST_NODE_NUL:
         case HANDLEBARS_AST_NODE_NUMBER:
         case HANDLEBARS_AST_NODE_PATH:

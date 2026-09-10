@@ -20,6 +20,8 @@
 #endif
 
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define HANDLEBARS_AST_PRIVATE
@@ -103,6 +105,7 @@ struct handlebars_ast_printer_context {
     int padding;
     int error;
     struct handlebars_string * output;
+    size_t depth;
     bool in_partial;
     bool in_raw_block;
 };
@@ -433,7 +436,11 @@ static void _handlebars_ast_print(struct handlebars_ast_node * ast_node, struct 
     if( unlikely(ast_node == NULL) ) {
         return;
     }
+    if( unlikely(ctx->depth >= HANDLEBARS_AST_PRINTER_STACK_SIZE) ) {
+        handlebars_throw(ctx->ctx, HANDLEBARS_STACK_OVERFLOW, "AST printer stack overflow");
+    }
 
+    ctx->depth++;
     switch( ast_node->type ) {
         case HANDLEBARS_AST_NODE_BOOLEAN:
             _handlebars_ast_print_boolean(ast_node, ctx);
@@ -496,21 +503,46 @@ static void _handlebars_ast_print(struct handlebars_ast_node * ast_node, struct 
             break;
         // LCOV_EXCL_STOP
     }
+    ctx->depth--;
 }
 
 #undef CONTEXT
 #define CONTEXT context
 
+static HBS_ATTR_NORETURN void handlebars_ast_printer_rethrow(
+    struct handlebars_context * context,
+    jmp_buf * previous
+) {
+    if( previous != NULL ) {
+        handlebars_longjmp(context, previous, context->e->num);
+    }
+    fprintf(stderr, "Throw with invalid jmp_buf: %s\n", handlebars_error_msg(context));
+    abort();
+}
+
 struct handlebars_string * handlebars_ast_print(struct handlebars_context * context, struct handlebars_ast_node * ast_node)
 {
+    struct handlebars_error * error = context->e;
+    jmp_buf * volatile previous = error->jmp;
     struct handlebars_string * output;
     struct handlebars_ast_printer_context * ctx = MC(handlebars_talloc_zero(context, struct handlebars_ast_printer_context));
+    jmp_buf buf;
+
     ctx->ctx = context;
-    ctx->output = handlebars_string_ctor(context, "", 0);
+
+    if( handlebars_setjmp_ex(context, &buf) ) {
+        error->jmp = previous;
+        handlebars_talloc_free(ctx);
+        handlebars_ast_printer_rethrow(context, previous);
+    }
+
+    ctx->output = talloc_steal(ctx, handlebars_string_ctor(context, "", 0));
     _handlebars_ast_print(ast_node, ctx);
+    ctx->output = handlebars_string_rtrim(ctx->output, HBS_STRL(" \t\r\n"));
     output = talloc_steal(context, ctx->output);
+    error->jmp = previous;
     handlebars_talloc_free(ctx);
-    return handlebars_string_rtrim(output, HBS_STRL(" \t\r\n"));
+    return output;
 }
 
 
@@ -673,7 +705,7 @@ static void _handlebars_ast_to_string_block(struct handlebars_ast_node * ast_nod
 
     if (ast_node->node.block.program) {
         if( ast_node->node.block.program->node.program.block_param1 ) {
-            __APPENDS("as |");
+            __APPENDS(" as |");
             __APPEND_STR(ast_node->node.block.program->node.program.block_param1);
             if( ast_node->node.block.program->node.program.block_param2 ) {
                 __APPENDS(" ");
@@ -755,7 +787,13 @@ static void _handlebars_ast_to_string_partial_block(struct handlebars_ast_node *
     __APPENDS("{{#> ");
     _handlebars_ast_to_string(ast_node->node.partial_block.path, ctx);
     if( ast_node->node.partial_block.params ) {
-        _handlebars_ast_to_string_list(ast_node->node.partial_block.params, ctx);
+        struct handlebars_ast_list_item * item;
+        struct handlebars_ast_list_item * tmp;
+
+        handlebars_ast_list_foreach(ast_node->node.partial_block.params, item, tmp) {
+            __APPENDS(" ");
+            __PRINT(item->data);
+        }
     }
     if( ast_node->node.partial_block.hash ) {
     	__APPENDS(" ");
@@ -783,8 +821,13 @@ static void _handlebars_ast_to_string_content(struct handlebars_ast_node * ast_n
         __APPEND_STR(ast_node->node.content.original);
     } else {
         struct handlebars_string *escaped = handlebars_str_replace(CONTEXT, ast_node->node.content.original, HBS_STRL("{{"), HBS_STRL("\\{{"));
+        if( escaped != ast_node->node.content.original ) {
+            talloc_steal(ctx, escaped);
+        }
         __APPEND_STR(escaped);
-        handlebars_string_delref(escaped);
+        if( escaped != ast_node->node.content.original ) {
+            handlebars_talloc_free(escaped);
+        }
     }
 }
 
@@ -821,6 +864,7 @@ static void _handlebars_ast_to_string_string(struct handlebars_ast_node * ast_no
     }
     __APPEND(quote);
     struct handlebars_string *tmp = handlebars_string_addcslashes(ctx->ctx, ast_node->node.string.value, quote, 1);
+    talloc_steal(ctx, tmp);
     __APPEND_STR(tmp);
     handlebars_talloc_free(tmp);
     __APPEND(quote);
@@ -869,15 +913,141 @@ static void _handlebars_ast_to_string_hash(struct handlebars_ast_node * ast_node
 
 
 
+// path.original keeps the compiler's normalized spelling, including prefixes
+// removed from path.parts. Validate its normalized suffix before combining
+// that prefix with the segments' source spelling.
+static bool handlebars_ast_path_literal_prefix_length(
+    struct handlebars_ast_node * ast_node,
+    size_t * prefix_length
+)
+{
+    struct handlebars_ast_list * ast_list = ast_node->node.path.parts;
+    struct handlebars_ast_list_item * item;
+    struct handlebars_ast_list_item * tmp;
+    struct handlebars_string * original = ast_node->node.path.original;
+    size_t parts_length = 0;
+    size_t original_length;
+    const char * cursor;
+    bool has_literal = false;
+
+    if( !original || !ast_list ) {
+        return false;
+    }
+
+    handlebars_ast_list_foreach(ast_list, item, tmp) {
+        struct handlebars_ast_node * segment = item->data;
+        struct handlebars_ast_node * next_segment = item->next
+            ? item->next->data
+            : NULL;
+        struct handlebars_string * part;
+        struct handlebars_string * separator;
+        size_t part_length;
+        size_t separator_length;
+
+        if( !segment || segment->type != HANDLEBARS_AST_NODE_PATH_SEGMENT ||
+            !segment->node.path_segment.part ||
+            !segment->node.path_segment.original ||
+            (next_segment &&
+                (next_segment->type != HANDLEBARS_AST_NODE_PATH_SEGMENT ||
+                 !next_segment->node.path_segment.separator)) ) {
+            return false;
+        }
+
+        part = segment->node.path_segment.part;
+        separator = next_segment
+            ? next_segment->node.path_segment.separator
+            : NULL;
+        part_length = hbs_str_len(part);
+        separator_length = separator ? hbs_str_len(separator) : 0;
+
+        if( parts_length > SIZE_MAX - part_length ||
+            parts_length + part_length > SIZE_MAX - separator_length ) {
+            return false;
+        }
+        parts_length += part_length + separator_length;
+        has_literal |= !handlebars_string_eq(
+            segment->node.path_segment.part,
+            segment->node.path_segment.original
+        );
+    }
+
+    original_length = hbs_str_len(original);
+    if( !has_literal || parts_length > original_length ) {
+        return false;
+    }
+
+    *prefix_length = original_length - parts_length;
+    cursor = hbs_str_val(original) + *prefix_length;
+    handlebars_ast_list_foreach(ast_list, item, tmp) {
+        struct handlebars_ast_node * segment = item->data;
+        struct handlebars_string * part = segment->node.path_segment.part;
+
+        if( memcmp(cursor, hbs_str_val(part), hbs_str_len(part)) != 0 ) {
+            return false;
+        }
+        cursor += hbs_str_len(part);
+        if( item->next ) {
+            struct handlebars_string * separator =
+                item->next->data->node.path_segment.separator;
+            if( memcmp(
+                    cursor,
+                    hbs_str_val(separator),
+                    hbs_str_len(separator)
+                ) != 0 ) {
+                return false;
+            }
+            cursor += hbs_str_len(separator);
+        }
+    }
+
+    return true;
+}
+
+static void handlebars_ast_to_string_path_segment(
+    struct handlebars_ast_node * segment,
+    struct handlebars_ast_printer_context * ctx
+)
+{
+    struct handlebars_string * part = segment->node.path_segment.part;
+    struct handlebars_string * escaped;
+
+    if( handlebars_string_eq(part, segment->node.path_segment.original) ) {
+        __APPEND_STR(part);
+        return;
+    }
+
+    __APPENDS("[");
+    // The lexer decodes escaped closing brackets. Re-encode them and keep a
+    // trailing backslash from escaping the bracket that closes this segment.
+    escaped = handlebars_string_addcslashes(ctx->ctx, part, HBS_STRL("]"));
+    talloc_steal(ctx, escaped);
+    __APPEND_STR(escaped);
+    if( hbs_str_len(part) > 0 &&
+        hbs_str_val(part)[hbs_str_len(part) - 1] == '\\' ) {
+        __APPENDS("\\");
+    }
+    handlebars_talloc_free(escaped);
+    __APPENDS("]");
+}
+
 static void _handlebars_ast_to_string_path(struct handlebars_ast_node * ast_node, struct handlebars_ast_printer_context * ctx, bool first_only)
 {
     struct handlebars_ast_list * ast_list = ast_node->node.path.parts;
     struct handlebars_ast_list_item * item;
     struct handlebars_ast_list_item * tmp;
+    size_t prefix_length;
 
     assert(ast_node->node.path.data == 0 || ast_node->node.path.data == 1);
 
-    if (ast_node->node.path.original) {
+    if( handlebars_ast_path_literal_prefix_length(ast_node, &prefix_length) ) {
+        __APPENDL(hbs_str_val(ast_node->node.path.original), prefix_length);
+        handlebars_ast_list_foreach(ast_list, item, tmp) {
+            handlebars_ast_to_string_path_segment(item->data, ctx);
+            if( item->next ) {
+                __APPEND_STR(item->next->data->node.path_segment.separator);
+            }
+        }
+    } else if (ast_node->node.path.original) {
         __APPEND_STR(ast_node->node.path.original);
     } else {
         if( ast_node->node.path.data ) {
@@ -906,7 +1076,11 @@ static void _handlebars_ast_to_string(struct handlebars_ast_node * ast_node, str
     if( unlikely(ast_node == NULL) ) {
         return;
     }
+    if( unlikely(ctx->depth >= HANDLEBARS_AST_PRINTER_STACK_SIZE) ) {
+        handlebars_throw(ctx->ctx, HANDLEBARS_STACK_OVERFLOW, "AST printer stack overflow");
+    }
 
+    ctx->depth++;
     switch( ast_node->type ) {
         case HANDLEBARS_AST_NODE_BOOLEAN:
             _handlebars_ast_to_string_boolean(ast_node, ctx);
@@ -969,6 +1143,7 @@ static void _handlebars_ast_to_string(struct handlebars_ast_node * ast_node, str
             break;
         // LCOV_EXCL_STOP
     }
+    ctx->depth--;
 }
 
 #undef CONTEXT
@@ -978,14 +1153,24 @@ struct handlebars_string * handlebars_ast_to_string(
     struct handlebars_context * context,
     struct handlebars_ast_node * ast_node
 ) {
-    // return handlebars_string_ctor(context, "", 0);
-    // return handlebars_ast_print(context, ast_node);
+    struct handlebars_error * error = context->e;
+    jmp_buf * volatile previous = error->jmp;
     struct handlebars_string * output;
     struct handlebars_ast_printer_context * ctx = MC(handlebars_talloc_zero(context, struct handlebars_ast_printer_context));
+    jmp_buf buf;
+
     ctx->ctx = context;
-    ctx->output = handlebars_string_ctor(context, "", 0);
+
+    if( handlebars_setjmp_ex(context, &buf) ) {
+        error->jmp = previous;
+        handlebars_talloc_free(ctx);
+        handlebars_ast_printer_rethrow(context, previous);
+    }
+
+    ctx->output = talloc_steal(ctx, handlebars_string_ctor(context, "", 0));
     _handlebars_ast_to_string(ast_node, ctx);
     output = talloc_steal(context, ctx->output);
+    error->jmp = previous;
     handlebars_talloc_free(ctx);
     return output;
 }

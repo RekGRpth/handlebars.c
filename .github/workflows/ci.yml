@@ -27,9 +27,9 @@ jobs:
               with:
                   submodules: recursive
             - name: Install packages
-              run: sudo apt-get install -y autotools-dev autoconf automake bats libtool m4 make pkg-config check libpcre3-dev libtalloc-dev libsubunit-dev lcov libjson-c-dev liblmdb-dev libyaml-dev ${{ matrix.CC }}
+              run: sudo apt-get install -y autotools-dev autoconf automake bats cmake g++ libtool m4 make pkg-config check libpcre2-dev libtalloc-dev libsubunit-dev lcov libjson-c-dev liblmdb-dev libyaml-dev ${{ matrix.CC }}
             - run: autoreconf -i
-            - run: ./configure
+            - run: ./configure --enable-handlebars-memory
               env:
                   CC: ${{ matrix.CC }}
                   # json-c undeprecated json_object_object_get, but the version in xenial
@@ -37,7 +37,111 @@ jobs:
                   CFLAGS: "-Wno-deprecated-declarations -Wno-error=deprecated-declarations"
             - run: make
             - run: make check
-            - run: make distcheck
+            - name: Verify distribution with allocation-failure testing disabled
+              run: make distcheck DISTCHECK_CONFIGURE_FLAGS="--disable-handlebars-memory"
+            - name: Build and test the release archive with CMake
+              env:
+                  CC: ${{ matrix.CC }}
+              run: |
+                  set -- handlebars-*.tar.gz
+                  test "$#" -eq 1
+                  test -f "$1"
+                  mkdir -p "$RUNNER_TEMP/cmake-dist/source"
+                  tar -xzf "$1" --strip-components=1 -C "$RUNNER_TEMP/cmake-dist/source"
+                  unset handlebars_export_dir handlebars_spec_dir handlebars_tokenizer_spec handlebars_parser_spec mustache_spec_dir
+                  cmake -S "$RUNNER_TEMP/cmake-dist/source" -B "$RUNNER_TEMP/cmake-dist/build" \
+                      -DCMAKE_BUILD_TYPE=Release \
+                      -DHANDLEBARS_ENABLE_MEMORY=ON
+                  cmake --build "$RUNNER_TEMP/cmake-dist/build" -j2
+                  ctest --test-dir "$RUNNER_TEMP/cmake-dist/build" --output-on-failure
+            - name: dump logs
+              if: ${{ failure() }}
+              run: |
+                  find tests -name "*.log" -print0 2>/dev/null |
+                  while IFS= read -r -d '' log; do
+                      echo "-- START ${log}";
+                      cat "${log}";
+                      echo "-- END";
+                  done
+
+    linux_lmdb_versions:
+        name: linux (LMDB ${{ matrix.lmdb }})
+        runs-on: ubuntu-24.04
+        strategy:
+            fail-fast: false
+            matrix:
+                lmdb: ["0.9.35", "1.0.1"]
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  submodules: recursive
+            - uses: actions/checkout@v6
+              with:
+                  repository: LMDB/lmdb
+                  ref: LMDB_${{ matrix.lmdb }}
+                  path: .lmdb
+            - name: Install packages
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y bats check cmake gcc g++ libjson-c-dev libpcre2-dev libsubunit-dev libtalloc-dev libyaml-dev make pkg-config
+            - name: Build selected LMDB version
+              run: make -C .lmdb/libraries/liblmdb liblmdb.a CFLAGS="-O2 -g -fPIC" -j2
+            - name: Configure with selected LMDB version
+              run: |
+                  cmake -S . -B build-lmdb \
+                      -DCMAKE_BUILD_TYPE=Release \
+                      -DHANDLEBARS_ENABLE_MEMORY=ON \
+                      -DLMDB_INCLUDE_DIR="$GITHUB_WORKSPACE/.lmdb/libraries/liblmdb" \
+                      -DLMDB_LIBRARIES="$GITHUB_WORKSPACE/.lmdb/libraries/liblmdb/liblmdb.a"
+            - run: cmake --build build-lmdb -j2
+            - run: ctest --test-dir build-lmdb --output-on-failure
+
+    linux_committed_autotools:
+        name: linux (committed Autotools outputs)
+        runs-on: ubuntu-24.04
+        env:
+            ACLOCAL: "false"
+            AUTOCONF: "false"
+            AUTOHEADER: "false"
+            AUTOMAKE: "false"
+            RE2C: "no"
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  submodules: recursive
+            - name: Install packages
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y bats check g++ gcc libjson-c-dev liblmdb-dev libpcre2-dev libsubunit-dev libtalloc-dev libyaml-dev make pkg-config
+            - name: Normalize generated-file timestamps
+              run: |
+                  touch \
+                      aclocal.m4 \
+                      configure \
+                      config.h.in \
+                      src/handlebars_config.h.in \
+                      Makefile.in \
+                      bench/Makefile.in \
+                      bin/Makefile.in \
+                      doc/Makefile.in \
+                      fuzz/Makefile.in \
+                      src/Makefile.in \
+                      tests/Makefile.in \
+                      build/* \
+                      src/handlebars.lex.c \
+                      src/handlebars.lex.h \
+                      src/handlebars.tab.c \
+                      src/handlebars.tab.h \
+                      src/handlebars_helpers_ht.h \
+                      src/handlebars_scanners.c
+            - name: Configure without regenerating Autotools outputs
+              run: ./configure --disable-bison --disable-flex --disable-gperf --enable-compile-warnings=yes
+            - run: make -j2
+            - name: Compile public value API as C++
+              run: g++ -std=c++11 -Wall -Wextra -Werror -pedantic-errors -I. -Isrc -c tests/test_value_api.cpp -o /tmp/test_value_api_cpp.o
+            - run: make check
+            - name: Verify tracked files were not regenerated
+              run: git diff --exit-code
             - name: dump logs
               if: ${{ failure() }}
               run: |
@@ -56,9 +160,9 @@ jobs:
             CC: clang-18
             CFLAGS: "-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"
             LDFLAGS: "-fsanitize=address,undefined"
-            # Check forks after allocating suite state, which looks leaked in each child.
-            # LeakSanitizer remains enabled in the dedicated fuzz workflow.
-            ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:strict_string_checks=1
+            # Keep Check in-process so LeakSanitizer sees fixture cleanup.
+            CK_FORK: "no"
+            ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:strict_string_checks=1
             UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         steps:
             - uses: actions/checkout@v6
@@ -67,7 +171,7 @@ jobs:
             - name: Install packages
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y autotools-dev autoconf automake bats check clang-18 libclang-rt-18-dev libjson-c-dev liblmdb-dev libpcre3-dev libsubunit-dev libtalloc-dev libtool libyaml-dev m4 make pkg-config
+                  sudo apt-get install -y autotools-dev autoconf automake bats check clang-18 libclang-rt-18-dev libjson-c-dev liblmdb-dev libpcre2-dev libsubunit-dev libtalloc-dev libtool libyaml-dev m4 make pkg-config
             - run: autoreconf -i
             - run: ./configure --disable-hardening --disable-valgrind
             - run: make -j2
@@ -98,7 +202,7 @@ jobs:
               with:
                   submodules: recursive
             - name: Install packages
-              run: sudo apt-get install -y autotools-dev autoconf automake bats libtool m4 make pkg-config check libpcre3-dev libtalloc-dev libsubunit-dev lcov libjson-c-dev liblmdb-dev libyaml-dev lcov ${{ matrix.CC }}
+              run: sudo apt-get install -y autotools-dev autoconf automake bats libtool m4 make pkg-config check libpcre2-dev libtalloc-dev libsubunit-dev lcov libjson-c-dev liblmdb-dev libyaml-dev lcov ${{ matrix.CC }}
             - run: autoreconf -i
             - run: ./configure --enable-code-coverage
               env:
@@ -137,7 +241,7 @@ jobs:
               with:
                   submodules: recursive
             - name: Install packages
-              run: sudo apt-get install -y autotools-dev autoconf automake bats libtool m4 make pkg-config check libpcre3-dev libtalloc-dev libsubunit-dev lcov libjson-c-dev liblmdb-dev libyaml-dev clang-tools html2text
+              run: sudo apt-get install -y autotools-dev autoconf automake bats libtool m4 make pkg-config check libpcre2-dev libtalloc-dev libsubunit-dev lcov libjson-c-dev liblmdb-dev libyaml-dev clang-tools html2text
             - run: autoreconf -i
             - run: scan-build ./configure
               env:
@@ -165,7 +269,7 @@ jobs:
               with:
                   submodules: recursive
             - name: Install packages
-              run: brew install autoconf automake bats-core json-c libtool libyaml lmdb pkg-config talloc check lcov pcre
+              run: brew install autoconf automake bats-core json-c libtool libyaml lmdb pkg-config talloc check lcov pcre2
             - name: create configure
               run: autoreconf -i
             - name: configure
@@ -213,42 +317,22 @@ jobs:
         steps:
             -   uses: actions/checkout@v6
 
-            -   name: Set Up Build Cache
-                uses: actions/cache@v6
-                id: nix-cache
-                with:
-                    path: /tmp/nix-store.nar
-                    key: nix-store.nar-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ matrix.attr }}
-                    restore-keys: |
-                        nix-store.nar-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ matrix.attr }}
-                        nix-store.nar-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
-                        nix-store.nar-${{ runner.os }}-
-
             -   uses: cachix/install-nix-action@v31
                 with:
                     nix_path: nixpkgs=channel:nixos-26.05
                     extra_nix_config: "system-features = nixos-test benchmark big-parallel kvm"
 
-            -   name: Import Nix Store Cache
-                if: "steps.nix-cache.outputs.cache-hit == 'true'"
-                run: |
-                    nix-store --import < /tmp/nix-store.nar
+            -   name: Restore and save Nix store
+                uses: nix-community/cache-nix-action@v7
+                with:
+                    primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}-${{ matrix.attr }}
+                    restore-prefixes-first-match: |
+                        nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}-
+                        nix-${{ runner.os }}-
+                    gc-max-store-size-linux: 1G
 
             -   run: sudo sysctl -w kernel.perf_event_paranoid=1
 
             -   run: nix build -L ".#${{ matrix.attr }}"
 
             #            -   run: nix flake check -L
-
-            # broken sigh
-            # -   name: Export Nix Store Cache
-            #     shell: bash
-            #     # partially based on https://github.com/NixOS/nix/issues/1245#issuecomment-282586759
-            #     run: |
-            #         drv="$(nix-store -qd "$(readlink result)")"
-            #         drvRefs="$( echo "$drv" | xargs nix-store -q --references )"
-            #         ( echo "$drvRefs" | grep '[.]drv$' | xargs nix-store -q --outputs ;
-            #           echo "$drvRefs" | grep -v '[.]drv$' ) | \
-            #             xargs nix-store -r | \
-            #             xargs nix-store -qR |
-            #             xargs nix-store --export > /tmp/nix-store.nar

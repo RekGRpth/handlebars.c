@@ -284,17 +284,17 @@ static int loadSpec(const char * spec)
     }
 
     // Parse JSON
-    result = json_tokener_parse(data);
+    result = hbs_test_json_parse_document(data, data_len);
     // @todo: parsing errors seem to cause segfaults....
     if( result == NULL ) {
-        fprintf(stderr, "Failed so parse JSON\n");
+        fprintf(stderr, "Failed to parse JSON in spec file: %s\n", filename);
         error = 1;
         goto error;
     }
 
     // Root object should be array
     if( json_object_get_type(result) != json_type_array ) {
-        fprintf(stderr, "Root JSON value was not array\n");
+        fprintf(stderr, "Root JSON value was not array in spec file: %s\n", filename);
         error = 1;
         goto error;
     }
@@ -331,11 +331,6 @@ START_TEST(test_ast_to_string_on_handlebars_spec)
     const char *actual;
     bool dont_match = false;
 
-    if (test->exception) {
-        fprintf(stderr, "SKIPPED #%d\n", _i);
-        return;
-    }
-
     tmpl = handlebars_string_ctor(HBSCTX(parser), test->tmpl, strlen(test->tmpl));
     const char *expected = normalize_template_whitespace(parser, tmpl);
 
@@ -344,7 +339,6 @@ START_TEST(test_ast_to_string_on_handlebars_spec)
     // it's mainly meant to be used with mustache templates
     if (
         NULL != strstr(expected, "else") ||
-        NULL != strstr(expected, "[") ||
         NULL != strstr(expected, "{{>(") ||
         NULL != strstr(expected, "\\{{")
     ) {
@@ -387,35 +381,59 @@ static bool should_skip(struct generic_test * test)
 #define MYCHECK(s, d, i) \
     if( 0 == strcmp(s, test->suite_name) && 0 == strcmp(d, test->description) && 0 == strcmp(i, test->it) ) return true;
 
-    // Still having issues with whitespace
-    MYCHECK("blocks", "blocks - standalone sections", "block standalone else sections can be disabled");
-
     // Decorators aren't implemented
     MYCHECKALL("blocks", "blocks - decorators");
-    MYCHECK("helpers", "helpers - block params", "should take presednece over parent block params");
 
     // Regressions
     MYCHECK("regressions", "Regressions", "GH-1065: Sparse arrays")
-    MYCHECK("regressions", "Regressions", "should support multiple levels of inline partials")
-    MYCHECK("regressions", "Regressions", "GH-1089: should support failover content in multiple levels of inline partials")
-    MYCHECK("regressions", "Regressions", "GH-1099: should support greater than 3 nested levels of inline partials");
-    MYCHECK("regressions", "Regressions", "GH-1186: Support block params for existing programs");
 
-    // Subexpressions
-    // This one might need to be handled in the parser
-    MYCHECK("subexpressions", "subexpressions", "subexpressions can\'t just be property lookups");
+    // stringParams was legacy pre-Glimmer Ember support and is rejected by
+    // Handlebars v5; see https://github.com/handlebars-lang/handlebars.js/issues/1145.
+    // Keep compiler opcode compatibility with v4, but do not implement the
+    // pushStringParam/types/hashTypes runtime protocol in the C VM.
     MYCHECK("subexpressions", "subexpressions", "in string params mode,");
     MYCHECK("subexpressions", "subexpressions", "as hashes in string params mode");
-    MYCHECK("subexpressions", "subexpressions", "string params for inner helper processed correctly");
-
-    // Partials
-    MYCHECK("partials", "partials", "registering undefined partial throws an exception");
-    MYCHECKALL("partials", "partials - inline partials");
 
     return false;
 
 #undef MYCCHECK
 }
+
+enum {
+    EXPECTED_RUNTIME_EXCLUSIONS = 11,
+    EXPECTED_AST_INAPPLICABLE = 40,
+};
+
+START_TEST(test_handlebars_spec_exclusion_budget)
+{
+    size_t runtime_exclusions = 0;
+    size_t ast_inapplicable = 0;
+
+    for (size_t i = 0; i < tests_len; i++) {
+        runtime_exclusions += should_skip(tests[i]);
+        ast_inapplicable += tests[i]->exception != 0;
+    }
+
+    fprintf(
+        stderr,
+        "Handlebars spec exclusions: %zu runtime, %zu AST-inapplicable\n",
+        runtime_exclusions,
+        ast_inapplicable
+    );
+    ck_assert_msg(
+        runtime_exclusions == EXPECTED_RUNTIME_EXCLUSIONS,
+        "Handlebars runtime exclusion count changed: expected %d, got %zu",
+        EXPECTED_RUNTIME_EXCLUSIONS,
+        runtime_exclusions
+    );
+    ck_assert_msg(
+        ast_inapplicable == EXPECTED_AST_INAPPLICABLE,
+        "Handlebars AST-inapplicable count changed: expected %d, got %zu",
+        EXPECTED_AST_INAPPLICABLE,
+        ast_inapplicable
+    );
+}
+END_TEST
 
 static inline void run_test(struct generic_test * test, int _i)
 {
@@ -429,13 +447,6 @@ static inline void run_test(struct generic_test * test, int _i)
     fprintf(stderr, "FLAGS: %ld\n", test->flags);
     fflush(stderr);
 #endif
-
-    //ck_assert_msg(shouldnt_skip(test), "Skipped");
-    if( should_skip(test) ) {
-        fprintf(stderr, "SKIPPED #%d\n", _i);
-        fflush(stderr);
-        return;
-    }
 
     // Parse
     struct handlebars_ast_node * ast = handlebars_parse_ex(parser, handlebars_string_ctor(HBSCTX(parser), test->tmpl, strlen(test->tmpl)), test->flags);
@@ -581,19 +592,17 @@ END_TEST
 static Suite * suite(void);
 static Suite * suite(void)
 {
-    // Load the spec
-    loadSpec("basic");
-    loadSpec("blocks");
-    loadSpec("builtins");
-    loadSpec("data");
-    loadSpec("helpers");
-    loadSpec("partials");
-    loadSpec("regressions");
-    loadSpec("strict");
-    //loadSpec("string-params");
-    loadSpec("subexpressions");
-    //loadSpec("track-ids");
-    loadSpec("whitespace-control");
+    // Every listed suite is required. string-params and track-ids are not
+    // currently part of the runtime suite.
+    const char * specs[] = {
+        "basic", "blocks", "builtins", "data", "helpers", "partials",
+        "regressions", "strict", "subexpressions", "whitespace-control"
+    };
+    for( size_t i = 0; i < sizeof(specs) / sizeof(specs[0]); i++ ) {
+        if( loadSpec(specs[i]) != 0 ) {
+            exit(EXIT_FAILURE);
+        }
+    }
     fprintf(stderr, "Loaded %zu test cases\n", tests_len);
 
     // Setup the suite
@@ -602,6 +611,10 @@ static Suite * suite(void)
     Suite * s = suite_create(title);
     int start = 0;
     int end = tests_len;
+
+    TCase * tc_exclusion_budget = tcase_create("Exclusion budget");
+    tcase_add_test(tc_exclusion_budget, test_handlebars_spec_exclusion_budget);
+    suite_add_tcase(s, tc_exclusion_budget);
 
     if( getenv("TEST_NUM") != NULL ) {
         int num;
@@ -614,11 +627,19 @@ static Suite * suite(void)
 
     TCase * tc_ast_to_string_on_handlebars_spec = tcase_create("AST to string on handlebars spec");
     tcase_add_checked_fixture(tc_ast_to_string_on_handlebars_spec, default_setup, default_teardown);
-    tcase_add_loop_test(tc_ast_to_string_on_handlebars_spec, test_ast_to_string_on_handlebars_spec, start, end);
+    for (int i = start; i < end; i++) {
+        if (!tests[i]->exception) {
+            tcase_add_loop_test(tc_ast_to_string_on_handlebars_spec, test_ast_to_string_on_handlebars_spec, i, i + 1);
+        }
+    }
     suite_add_tcase(s, tc_ast_to_string_on_handlebars_spec);
 
     tcase_add_checked_fixture(tc_handlebars_spec, default_setup, default_teardown);
-    tcase_add_loop_test(tc_handlebars_spec, test_handlebars_spec, start, end);
+    for (int i = start; i < end; i++) {
+        if (!should_skip(tests[i])) {
+            tcase_add_loop_test(tc_handlebars_spec, test_handlebars_spec, i, i + 1);
+        }
+    }
     suite_add_tcase(s, tc_handlebars_spec);
 
     return s;

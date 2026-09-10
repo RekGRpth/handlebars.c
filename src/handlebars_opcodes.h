@@ -99,7 +99,8 @@ enum handlebars_operand_type {
     handlebars_operand_type_boolean = 1,
     handlebars_operand_type_long = 2,
     handlebars_operand_type_string = 3,
-    handlebars_operand_type_array = 4
+    handlebars_operand_type_array = 4,
+    handlebars_operand_type_double = 5
 };
 
 extern const size_t HANDLEBARS_OPCODE_SIZE;
@@ -150,6 +151,18 @@ void handlebars_operand_set_boolval(
 void handlebars_operand_set_longval(
     struct handlebars_operand * operand,
     long arg
+) HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Set the value of an operand to a double
+ *
+ * @param[in] operand The operand of which to change the value
+ * @param[in] arg The double value
+ * @return void
+ */
+void handlebars_operand_set_doubleval(
+    struct handlebars_operand * operand,
+    double arg
 ) HBS_ATTR_NONNULL_ALL;
 
 /**
@@ -213,10 +226,10 @@ enum handlebars_opcode_type handlebars_opcode_reverse_readable_type(
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_CONST;
 
 /**
- * @brief Get the number of operands a particular opcode type should have
+ * @brief Get the maximum number of operands a particular opcode type may have
  *
  * @param[in] type The opcode type
- * @return The number of operands
+ * @return The maximum number of operands, including optional operands
  */
 short handlebars_opcode_num_operands(
     enum handlebars_opcode_type type
@@ -241,6 +254,7 @@ struct handlebars_operand_array {
 union handlebars_operand_internals {
     bool boolval;
     long longval;
+    double doubleval;
     struct handlebars_operand_string string;
     struct handlebars_operand_array array;
 };
@@ -258,6 +272,22 @@ struct handlebars_opcode {
     struct handlebars_operand op4;
     struct handlebars_locinfo loc;
 };
+
+// Inline-partial argument scans must not cross an output statement or
+// another decorator registration.
+static inline bool handlebars_opcode_is_statement_boundary(enum handlebars_opcode_type type)
+{
+    switch( type ) {
+        case handlebars_opcode_type_append:
+        case handlebars_opcode_type_append_escaped:
+        case handlebars_opcode_type_append_content:
+        case handlebars_opcode_type_register_decorator:
+        case handlebars_opcode_type_return:
+            return true;
+        default:
+            return false;
+    }
+}
 
 #endif /* HANDLEBARS_OPCODES_PRIVATE */
 

@@ -22,7 +22,11 @@
 #include <check.h>
 #include <talloc.h>
 
+#define HANDLEBARS_AST_PRIVATE
+#define HANDLEBARS_AST_LIST_PRIVATE
 #include "handlebars.h"
+#include "handlebars_ast.h"
+#include "handlebars_ast_list.h"
 #include "handlebars_memory.h"
 #include "handlebars_parser.h"
 #include "handlebars_string.h"
@@ -143,6 +147,169 @@ START_TEST(test_lex)
     ck_assert_str_eq("}}", hbs_str_val(handlebars_token_get_text(tokens[2])));
 
     ck_assert_ptr_eq(NULL, tokens[3]);
+}
+END_TEST
+
+START_TEST(test_lex_reuse)
+{
+    struct handlebars_token ** tokens;
+
+    tokens = handlebars_lex_ex(parser, handlebars_string_ctor(context, HBS_STRL("{{longer}}")));
+    ck_assert_ptr_nonnull(tokens);
+    ck_assert_ptr_nonnull(tokens[0]);
+
+    tokens = handlebars_lex_ex(parser, handlebars_string_ctor(context, HBS_STRL("ok")));
+    ck_assert_ptr_nonnull(tokens);
+    ck_assert_ptr_nonnull(tokens[0]);
+    ck_assert_int_eq(CONTENT, handlebars_token_get_type(tokens[0]));
+    ck_assert_str_eq("ok", hbs_str_val(handlebars_token_get_text(tokens[0])));
+    ck_assert_ptr_null(tokens[1]);
+}
+END_TEST
+
+START_TEST(test_lex_then_parse_reuse)
+{
+    struct handlebars_token ** tokens;
+    struct handlebars_ast_node * ast;
+
+    tokens = handlebars_lex_ex(parser, handlebars_string_ctor(context, HBS_STRL("{{longer}}")));
+    ck_assert_ptr_nonnull(tokens);
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("ok")),
+        0
+    );
+    ck_assert_ptr_nonnull(ast);
+}
+END_TEST
+
+START_TEST(test_parser_reuse)
+{
+    struct handlebars_ast_node * ast;
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("{{longer}}")),
+        0
+    );
+    ck_assert_ptr_nonnull(ast);
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("ok")),
+        0
+    );
+    ck_assert_ptr_nonnull(ast);
+}
+END_TEST
+
+START_TEST(test_parser_reuse_after_error)
+{
+    struct handlebars_ast_node * ast;
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("{{unclosed")),
+        0
+    );
+    ck_assert_ptr_null(ast);
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("ok")),
+        0
+    );
+    ck_assert_ptr_nonnull(ast);
+}
+END_TEST
+
+START_TEST(test_parse_error_column_resets_after_newline)
+{
+    struct handlebars_locinfo short_loc;
+    struct handlebars_locinfo long_loc;
+    struct handlebars_ast_node * ast;
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("a\n{{) }}")),
+        0
+    );
+    ck_assert_ptr_null(ast);
+    short_loc = handlebars_error_loc(context);
+
+    handlebars_error_clear(context);
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("abcdefghij\n{{) }}")),
+        0
+    );
+    ck_assert_ptr_null(ast);
+    long_loc = handlebars_error_loc(context);
+
+    ck_assert_int_eq(short_loc.last_line, 2);
+    ck_assert_int_eq(long_loc.last_line, 2);
+    ck_assert_int_eq(short_loc.last_column, 2);
+    ck_assert_int_eq(long_loc.last_column, 2);
+}
+END_TEST
+
+START_TEST(test_parse_error_column_after_comment)
+{
+    struct handlebars_locinfo base_loc;
+    struct handlebars_locinfo comment_loc;
+    struct handlebars_ast_node * ast;
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("{{) }}")),
+        0
+    );
+    ck_assert_ptr_null(ast);
+    base_loc = handlebars_error_loc(context);
+
+    handlebars_error_clear(context);
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("{{!x}}{{) }}")),
+        0
+    );
+    ck_assert_ptr_null(ast);
+    comment_loc = handlebars_error_loc(context);
+
+    ck_assert_int_eq(base_loc.last_line, 1);
+    ck_assert_int_eq(comment_loc.last_line, 1);
+    ck_assert_int_eq(base_loc.last_column, 2);
+    ck_assert_int_eq(comment_loc.last_column, 8);
+}
+END_TEST
+
+START_TEST(test_parser_reuse_resets_whitespace_state)
+{
+    struct handlebars_ast_node * ast;
+    struct handlebars_ast_list * statements;
+    struct handlebars_ast_node * content;
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("first")),
+        0
+    );
+    ck_assert_ptr_nonnull(ast);
+
+    ast = handlebars_parse_ex(
+        parser,
+        handlebars_string_ctor(context, HBS_STRL("{{! comment}}\nok")),
+        0
+    );
+    ck_assert_ptr_nonnull(ast);
+
+    statements = ast->node.program.statements;
+    ck_assert_ptr_nonnull(statements);
+    ck_assert_ptr_nonnull(statements->last);
+    content = statements->last->data;
+    ck_assert_int_eq(content->type, HANDLEBARS_AST_NODE_CONTENT);
+    ck_assert_hbs_str_eq_cstr(content->node.content.value, "ok");
 }
 END_TEST
 
@@ -267,8 +434,7 @@ START_TEST(test_context_get_errmsg_failed_alloc)
     actual = handlebars_error_message(context);
     handlebars_memory_fail_disable();
 
-    //ck_assert_ptr_eq(NULL, actual);
-    ck_assert_ptr_eq(handlebars_error_msg(context), actual);
+    ck_assert_ptr_eq(NULL, actual);
 #else
     fprintf(stderr, "Skipped, memory testing functions are disabled\n");
 #endif
@@ -296,6 +462,52 @@ START_TEST(test_context_get_errmsg_js)
 }
 END_TEST
 
+START_TEST(test_context_get_errmsg_preserves_long_message)
+{
+    static const char suffix[] = " on line 12, column 34";
+    struct handlebars_locinfo loc = {0};
+    char message[601];
+    char * actual;
+
+    memset(message, 'x', sizeof(message) - 1);
+    memcpy(message + sizeof(message) - 5, "TAIL", 4);
+    message[sizeof(message) - 1] = '\0';
+    loc.last_line = 12;
+    loc.last_column = 34;
+
+    context->e->msg = message;
+    context->e->loc = loc;
+    actual = handlebars_error_message(context);
+
+    ck_assert_ptr_nonnull(actual);
+    ck_assert_uint_eq(strlen(actual), strlen(message) + strlen(suffix));
+    ck_assert_str_eq(actual + sizeof(message) - 5, "TAIL on line 12, column 34");
+}
+END_TEST
+
+START_TEST(test_context_get_errmsg_js_preserves_long_message)
+{
+    static const char prefix[] = "Parse error on line 12, column 34 : ";
+    struct handlebars_locinfo loc = {0};
+    char message[601];
+    char * actual;
+
+    memset(message, 'x', sizeof(message) - 1);
+    memcpy(message + sizeof(message) - 5, "TAIL", 4);
+    message[sizeof(message) - 1] = '\0';
+    loc.first_line = 12;
+    loc.first_column = 34;
+
+    context->e->msg = message;
+    context->e->loc = loc;
+    actual = handlebars_error_message_js(context);
+
+    ck_assert_ptr_nonnull(actual);
+    ck_assert_uint_eq(strlen(actual), strlen(prefix) + strlen(message));
+    ck_assert_str_eq(actual + strlen(actual) - 4, "TAIL");
+}
+END_TEST
+
 START_TEST(test_context_get_errmsg_js_failed_alloc)
 {
 #ifdef HANDLEBARS_MEMORY
@@ -313,11 +525,152 @@ START_TEST(test_context_get_errmsg_js_failed_alloc)
     actual = handlebars_error_message_js(context);
     handlebars_memory_fail_disable();
 
-    //ck_assert_ptr_eq(NULL, actual);
-    ck_assert_ptr_eq(handlebars_error_msg(context), actual);
+    ck_assert_ptr_eq(NULL, actual);
 #else
     fprintf(stderr, "Skipped, memory testing functions are disabled\n");
 #endif
+}
+END_TEST
+
+static void throw_and_catch(
+    struct handlebars_context * ctx,
+    const char * argument,
+    bool wrap
+) {
+    jmp_buf * volatile previous = ctx->e->jmp;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(ctx, &buf) ) {
+        ctx->e->jmp = previous;
+        return;
+    }
+
+    if( wrap ) {
+        handlebars_throw(ctx, HANDLEBARS_ERROR, "wrapped: %s", argument);
+    } else {
+        handlebars_throw(ctx, HANDLEBARS_ERROR, "%s", argument);
+    }
+    ctx->e->jmp = previous;
+    ck_abort_msg("Expected an error");
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+static int test_set_memlimit(const void * ptr, size_t max_size)
+{
+    return talloc_set_memlimit(ptr, max_size);
+}
+#pragma GCC diagnostic pop
+
+START_TEST(test_error_message_replaces_previous_allocation)
+{
+    size_t blocks_before = talloc_total_blocks(context);
+    size_t blocks_after_first_error;
+
+    throw_and_catch(context, "first error", false);
+    blocks_after_first_error = talloc_total_blocks(context);
+    ck_assert_uint_eq(blocks_after_first_error, blocks_before + 1);
+    ck_assert_ptr_eq(talloc_parent(handlebars_error_msg(context)), context->e);
+    ck_assert_str_eq(handlebars_error_msg(context), "first error");
+
+    throw_and_catch(context, "second error", false);
+    ck_assert_uint_eq(talloc_total_blocks(context), blocks_after_first_error);
+    ck_assert_ptr_eq(talloc_parent(handlebars_error_msg(context)), context->e);
+    ck_assert_str_eq(handlebars_error_msg(context), "second error");
+}
+END_TEST
+
+START_TEST(test_error_message_supports_self_rethrow)
+{
+    throw_and_catch(context, "original error", false);
+    throw_and_catch(context, handlebars_error_msg(context), true);
+
+    ck_assert_str_eq(handlebars_error_msg(context), "wrapped: original error");
+    ck_assert_ptr_eq(talloc_parent(handlebars_error_msg(context)), context->e);
+}
+END_TEST
+
+START_TEST(test_error_message_format_failure_releases_previous)
+{
+    size_t error_size;
+
+    throw_and_catch(context, "original error", false);
+    error_size = talloc_total_size(context->e);
+
+    ck_assert_int_eq(test_set_memlimit(context->e, error_size), 0);
+
+    throw_and_catch(context, "replacement error", false);
+
+    ck_assert_int_eq(test_set_memlimit(context->e, 0), 0);
+
+    ck_assert_int_eq(handlebars_error_num(context), HANDLEBARS_NOMEM);
+    ck_assert_ptr_nonnull(strstr(handlebars_error_msg(context), "Out of memory"));
+    ck_assert_uint_eq(talloc_total_blocks(context->e), 1);
+
+    throw_and_catch(context, "recovered error", false);
+    ck_assert_int_eq(handlebars_error_num(context), HANDLEBARS_ERROR);
+    ck_assert_str_eq(handlebars_error_msg(context), "recovered error");
+    ck_assert_ptr_eq(talloc_parent(handlebars_error_msg(context)), context->e);
+    ck_assert_uint_eq(talloc_total_blocks(context->e), 2);
+}
+END_TEST
+
+START_TEST(test_error_message_replacement_preserves_memlimit)
+{
+    size_t size_before = talloc_total_size(context);
+    int i;
+
+    ck_assert_int_eq(test_set_memlimit(context, size_before + 64 * 1024), 0);
+    for( i = 0; i < 5000; i++ ) {
+        throw_and_catch(context, "an error message of some length", false);
+        ck_assert_int_eq(handlebars_error_num(context), HANDLEBARS_ERROR);
+    }
+    ck_assert_int_eq(test_set_memlimit(context, 0), 0);
+
+    ck_assert_str_eq(handlebars_error_msg(context), "an error message of some length");
+    ck_assert_ptr_eq(talloc_parent(handlebars_error_msg(context)), context->e);
+    ck_assert_uint_eq(talloc_total_blocks(context->e), 2);
+}
+END_TEST
+
+START_TEST(test_error_message_replacement_preserves_other_children)
+{
+    char * child = talloc_strdup(context->e, "unrelated child");
+
+    ck_assert_ptr_nonnull(child);
+    throw_and_catch(context, "first error", false);
+    throw_and_catch(context, "second error", false);
+
+    ck_assert_str_eq(child, "unrelated child");
+    ck_assert_ptr_eq(talloc_parent(child), context->e);
+    ck_assert_str_eq(handlebars_error_msg(context), "second error");
+}
+END_TEST
+
+START_TEST(test_error_message_copy_survives_next_error)
+{
+    char * copy;
+
+    throw_and_catch(context, "first error", false);
+    copy = handlebars_error_message(context);
+    ck_assert_ptr_nonnull(copy);
+
+    throw_and_catch(context, "second error", false);
+
+    ck_assert_ptr_nonnull(strstr(copy, "first error"));
+    ck_assert_str_eq(handlebars_error_msg(context), "second error");
+}
+END_TEST
+
+START_TEST(test_error_message_outlives_bound_context)
+{
+    struct handlebars_parser * child = handlebars_parser_ctor(context);
+
+    throw_and_catch(HBSCTX(child), "temporary context error", false);
+    handlebars_parser_dtor(child);
+
+    ck_assert_str_eq(handlebars_error_msg(context), "temporary context error");
+    ck_assert_ptr_eq(talloc_parent(handlebars_error_msg(context)), context->e);
 }
 END_TEST
 
@@ -347,21 +700,37 @@ static Suite * suite(void)
 
     REGISTER_TEST_FIXTURE(s, test_version, "Version");
     REGISTER_TEST_FIXTURE(s, test_talloc_array_rejects_unrepresentable_count, "Talloc Array Count Bounds");
-    REGISTER_TEST_FIXTURE(s, test_talloc_realloc_size_preserves_size_t, "Talloc Realloc Size Width");
+    REGISTER_MEMORY_TEST_FIXTURE(s, test_talloc_realloc_size_preserves_size_t, "Talloc Realloc Size Width");
     REGISTER_TEST_FIXTURE(s, test_version_string, "Version String");
     REGISTER_TEST_FIXTURE(s, test_handlebars_spec_version_string, "Handlebars Spec Version String");
     REGISTER_TEST_FIXTURE(s, test_mustache_spec_version_string, "Mustache Spec Version String");
     REGISTER_TEST_FIXTURE(s, test_lex, "Lex Convenience Function");
+    REGISTER_TEST_FIXTURE(s, test_lex_reuse, "Lexer reuse");
+    REGISTER_TEST_FIXTURE(s, test_lex_then_parse_reuse, "Lexer then parser reuse");
+    REGISTER_TEST_FIXTURE(s, test_parser_reuse, "Parser reuse");
+    REGISTER_TEST_FIXTURE(s, test_parser_reuse_after_error, "Parser reuse after error");
+    REGISTER_TEST_FIXTURE(s, test_parse_error_column_resets_after_newline, "Parse error column resets after newline");
+    REGISTER_TEST_FIXTURE(s, test_parse_error_column_after_comment, "Parse error column after comment");
+    REGISTER_TEST_FIXTURE(s, test_parser_reuse_resets_whitespace_state, "Parser reuse resets whitespace state");
     REGISTER_TEST_FIXTURE(s, test_parse_rejects_embedded_nul, "Reject Embedded NUL");
     REGISTER_TEST_FIXTURE(s, test_parse_handles_empty_trimmed_block, "Parse Empty Trimmed Block");
     REGISTER_TEST_FIXTURE(s, test_parse_handles_empty_right_trimmed_block, "Parse Empty Right-Trimmed Block");
     REGISTER_TEST_FIXTURE(s, test_context_ctor_dtor, "Constructor/Destructor");
-    REGISTER_TEST_FIXTURE(s, test_context_ctor_failed_alloc, "Constructor (failed alloc)");
-    REGISTER_TEST_FIXTURE(s, test_context_ctor_ex_failed_alloc, "Constructor ex (failed alloc)");
+    REGISTER_MEMORY_TEST_FIXTURE(s, test_context_ctor_failed_alloc, "Constructor (failed alloc)");
+    REGISTER_MEMORY_TEST_FIXTURE(s, test_context_ctor_ex_failed_alloc, "Constructor ex (failed alloc)");
     REGISTER_TEST_FIXTURE(s, test_context_get_errmsg, "Get error message");
-    REGISTER_TEST_FIXTURE(s, test_context_get_errmsg_failed_alloc, "Get error message (failed alloc)");
+    REGISTER_MEMORY_TEST_FIXTURE(s, test_context_get_errmsg_failed_alloc, "Get error message (failed alloc)");
     REGISTER_TEST_FIXTURE(s, test_context_get_errmsg_js, "Get error message (js compat)");
-    REGISTER_TEST_FIXTURE(s, test_context_get_errmsg_js_failed_alloc, "Get error message (js compat) (failed alloc)");
+    REGISTER_TEST_FIXTURE(s, test_context_get_errmsg_preserves_long_message, "Get error message preserves long messages");
+    REGISTER_TEST_FIXTURE(s, test_context_get_errmsg_js_preserves_long_message, "Get error message (js compat) preserves long messages");
+    REGISTER_MEMORY_TEST_FIXTURE(s, test_context_get_errmsg_js_failed_alloc, "Get error message (js compat) (failed alloc)");
+    REGISTER_TEST_FIXTURE(s, test_error_message_replaces_previous_allocation, "Error message replaces previous allocation");
+    REGISTER_TEST_FIXTURE(s, test_error_message_supports_self_rethrow, "Error message supports self-rethrow");
+    REGISTER_TEST_FIXTURE(s, test_error_message_format_failure_releases_previous, "Error message format failure releases previous allocation");
+    REGISTER_TEST_FIXTURE(s, test_error_message_replacement_preserves_memlimit, "Error message replacement preserves memory limit");
+    REGISTER_TEST_FIXTURE(s, test_error_message_replacement_preserves_other_children, "Error message replacement preserves other children");
+    REGISTER_TEST_FIXTURE(s, test_error_message_copy_survives_next_error, "Error message copy survives next error");
+    REGISTER_TEST_FIXTURE(s, test_error_message_outlives_bound_context, "Error message outlives bound context");
     REGISTER_TEST_FIXTURE(s, test_context_bind_failure, "Get context bind (failed)");
 
     return s;

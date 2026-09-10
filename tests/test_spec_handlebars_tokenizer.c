@@ -174,7 +174,7 @@ static int loadSpec(const char * filename) {
     }
 
     // Parse JSON
-    result = json_tokener_parse(data);
+    result = hbs_test_json_parse_document(data, data_len);
     // @todo: parsing errors seem to cause segfaults....
     if( result == NULL ) {
         fprintf(stderr, "Failed so parse JSON\n");
@@ -247,7 +247,7 @@ static Suite * suite(void)
 
     TCase * tc_handlebars_spec_tokenizer = tcase_create(title);
     tcase_add_checked_fixture(tc_handlebars_spec_tokenizer, default_setup, default_teardown);
-    tcase_add_loop_test(tc_handlebars_spec_tokenizer, handlebars_spec_tokenizer, 0, tests_len - 1);
+    tcase_add_loop_test(tc_handlebars_spec_tokenizer, handlebars_spec_tokenizer, 0, tests_len);
     suite_add_tcase(s, tc_handlebars_spec_tokenizer);
 
     return s;

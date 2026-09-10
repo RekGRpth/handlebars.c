@@ -67,6 +67,8 @@ struct handlebars_map {
     uint32_t vec_capacity;
 
     bool is_in_iteration;
+    size_t active_iteration_locks;
+    size_t active_iterators;
 
     struct handlebars_map_entry data[];
 };
@@ -83,6 +85,15 @@ struct ht_find_result {
 struct map_sort_r_arg {
     handlebars_map_kv_compare_r_func compare;
     const void * arg;
+};
+
+struct map_copy_ctor_state {
+    struct handlebars_map * map;
+};
+
+struct map_mutation_state {
+    struct handlebars_map * original;
+    struct handlebars_map * map;
 };
 
 static short HANDLEBARS_MAP_MIN_LOAD_FACTOR = 10;
@@ -304,6 +315,75 @@ void handlebars_map_delref(struct handlebars_map * map)
 #endif
 }
 
+void handlebars_map_iterator_acquire(struct handlebars_map * map)
+{
+    if( unlikely(map->active_iterators == SIZE_MAX) ) {
+        handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Too many active map iterators");
+    }
+    map->active_iterators++;
+#ifndef HANDLEBARS_NO_REFCOUNT
+    assert(handlebars_rc_refcount(&map->rc) >= 1);
+    handlebars_map_addref(map);
+#endif
+}
+
+void handlebars_map_iterator_release(struct handlebars_map * map)
+{
+    assert(map->active_iterators > 0);
+    map->active_iterators--;
+#ifndef HANDLEBARS_NO_REFCOUNT
+    handlebars_map_delref(map);
+#endif
+}
+
+bool handlebars_map_iteration_acquire(struct handlebars_map * map)
+{
+    if( unlikely(map->active_iteration_locks == SIZE_MAX) ) {
+        handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Too many active map iterations");
+    }
+    map->active_iteration_locks++;
+
+#ifndef HANDLEBARS_NO_REFCOUNT
+    if( handlebars_rc_refcount(&map->rc) >= 1 ) {
+        handlebars_map_addref(map);
+        return true;
+    }
+#endif
+
+    return false;
+}
+
+void handlebars_map_iteration_release(struct handlebars_map * map, bool retained)
+{
+    assert(map->active_iteration_locks > 0);
+    map->active_iteration_locks--;
+#ifndef HANDLEBARS_NO_REFCOUNT
+    if( retained ) {
+        handlebars_map_delref(map);
+    }
+#else
+    (void) retained;
+#endif
+}
+
+struct handlebars_context * handlebars_map_get_context(struct handlebars_map * map)
+{
+    return map->ctx;
+}
+
+bool handlebars_map_is_shared(
+    struct handlebars_map * map,
+    size_t expected_references
+) {
+#ifndef HANDLEBARS_NO_REFCOUNT
+    return handlebars_rc_refcount(&map->rc) > expected_references;
+#else
+    (void) map;
+    (void) expected_references;
+    return false;
+#endif
+}
+
 void handlebars_map_addref_ex(struct handlebars_map * map, const char * expr, const char * loc)
 {
 #ifndef HANDLEBARS_NO_REFCOUNT
@@ -394,19 +474,99 @@ struct handlebars_map * handlebars_map_ctor(struct handlebars_context * ctx, siz
     return map;
 }
 
+static void map_copy_ctor_with_capacity_init(
+    struct handlebars_map * prev_map,
+    size_t new_capacity,
+    struct map_copy_ctor_state * state
+)
+{
+    struct handlebars_map_entry * vec = map_vec(prev_map);
+
+    state->map = handlebars_map_ctor(prev_map->ctx, new_capacity);
+    for( size_t index = 0; index < prev_map->vec_offset; index++ ) {
+        if( vec[index].key != NULL ) {
+            state->map = handlebars_map_add(
+                state->map,
+                vec[index].key,
+                &vec[index].value
+            );
+        }
+    }
+}
+
+static void map_unpublished_dtor(struct handlebars_map * map)
+{
+#ifdef HANDLEBARS_NO_REFCOUNT
+    /* No-refcount maps own copied keys through their arena rather than
+     * reference counts. Reclaim those unique copies before the map itself. */
+    struct handlebars_map_entry * vec = map_vec(map);
+    for( size_t index = 0; index < map->vec_offset; index++ ) {
+        if( vec[index].key != NULL ) {
+            handlebars_talloc_free(vec[index].key);
+            vec[index].key = NULL;
+            handlebars_value_dtor(&vec[index].value);
+        }
+    }
+#endif
+
+    handlebars_map_dtor(map);
+}
+
+static HBS_ATTR_NORETURN void map_rethrow(
+    struct handlebars_context * context,
+    jmp_buf * previous
+)
+{
+    if( previous != NULL ) {
+        handlebars_longjmp(context, previous, context->e->num);
+    }
+    const char * message = handlebars_error_msg(context);
+    fprintf(stderr, "Throw with invalid jmp_buf: %s\n", message != NULL ? message : "(no error message)");
+    abort();
+}
+
+HBS_ATTR_NOINLINE
+static struct handlebars_map * map_copy_ctor_with_capacity_guarded(
+    struct handlebars_map * prev_map,
+    size_t new_capacity,
+    struct map_copy_ctor_state * state
+)
+{
+    struct handlebars_error * error = prev_map->ctx->e;
+    jmp_buf * volatile previous = error->jmp;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(prev_map->ctx, &buf) ) {
+        error->jmp = previous;
+        if( state->map != NULL ) {
+            map_unpublished_dtor(state->map);
+            state->map = NULL;
+        }
+        map_rethrow(prev_map->ctx, previous);
+    }
+
+    map_copy_ctor_with_capacity_init(prev_map, new_capacity, state);
+    error->jmp = previous;
+    return state->map;
+}
+
+static struct handlebars_map * map_copy_ctor_with_capacity(
+    struct handlebars_map * prev_map,
+    size_t new_capacity
+)
+{
+    struct map_copy_ctor_state state = {0};
+
+    return map_copy_ctor_with_capacity_guarded(prev_map, new_capacity, &state);
+}
+
 struct handlebars_map * handlebars_map_copy_ctor(struct handlebars_map * prev_map, size_t new_capacity)
 {
     if (new_capacity < prev_map->vec_capacity) {
         new_capacity = prev_map->vec_capacity;
     }
 
-    struct handlebars_map * map = handlebars_map_ctor(prev_map->ctx, new_capacity);
-
-    handlebars_map_foreach(prev_map, index, key, value) {
-        map = handlebars_map_add(map, key, value);
-    } handlebars_map_foreach_end(prev_map);
-
-    return map;
+    return map_copy_ctor_with_capacity(prev_map, new_capacity);
 }
 
 
@@ -416,54 +576,203 @@ struct handlebars_map * handlebars_map_copy_ctor(struct handlebars_map * prev_ma
 
 void handlebars_map_dtor(struct handlebars_map * map)
 {
-    handlebars_map_foreach(map, index, key, value) {
-        handlebars_string_delref(key);
-        handlebars_value_dtor(value);
-    } handlebars_map_foreach_end(map);
+    struct handlebars_map_entry * vec = map_vec(map);
+
+    for( size_t index = 0; index < map->vec_offset; index++ ) {
+        if( vec[index].key != NULL ) {
+            handlebars_string_delref(vec[index].key);
+            handlebars_value_dtor(&vec[index].value);
+        }
+    }
 
     handlebars_talloc_free(map);
 }
 
-struct handlebars_map * handlebars_map_add(struct handlebars_map * map, struct handlebars_string * key, struct handlebars_value * value)
+static bool map_direct_iteration_is_locked(struct handlebars_map * map)
 {
-    struct ht_find_result o = map_find_entry(map, key);
+    return map->is_in_iteration
+        || map->active_iteration_locks > 0;
+}
+
+static bool map_in_place_mutation_is_locked(struct handlebars_map * map)
+{
+    return map->is_in_iteration
+        || map->active_iteration_locks > 0
+        || map->active_iterators > 0;
+}
+
+static bool map_rehash_required(
+    struct handlebars_map * map,
+    bool force
+)
+{
+    /* Direct iteration preserves the legacy contract that removal and value
+     * replacement happen in place, including when the map has multiple value
+     * owners. A value iterator instead retains an immutable snapshot in
+     * refcounted builds. Mutating while both iterator kinds are active cannot
+     * satisfy both contracts, so reject it before either map is changed. */
+    if( map_direct_iteration_is_locked(map) ) {
+        if( unlikely(map->active_iterators > 0) ) {
+            handlebars_throw(
+                map->ctx,
+                HANDLEBARS_ERROR,
+                "Cannot mutate a map while direct and value iterators are both active"
+            );
+        }
+        return false;
+    }
+
+#ifndef HANDLEBARS_NO_REFCOUNT
+    if( handlebars_rc_refcount(&map->rc) > 1 ) {
+        return true;
+    }
+#endif
+
+#ifdef HANDLEBARS_NO_REFCOUNT
+    /* Without refcounts, a value iterator cannot retain an immutable snapshot,
+     * so keep its live backing vector stable instead. */
+    if( map->active_iterators > 0 ) {
+        return false;
+    }
+#endif
+
+    return force
+        || map->vec_offset == map->vec_capacity
+        || handlebars_map_load_factor(map) > HANDLEBARS_MAP_MAX_LOAD_FACTOR;
+}
+
+static struct handlebars_map * map_rehash_prepare(
+    struct handlebars_map * map,
+    bool force
+)
+{
+    if( map_rehash_required(map, force) ) {
+        size_t vec_capacity = (size_t) 1 << map_choose_vec_capacity_log2(map->i + 1);
+        return map_copy_ctor_with_capacity(map, vec_capacity);
+    }
+
+    return map;
+}
+
+static struct handlebars_map * map_rehash_commit(
+    struct handlebars_map * prev_map,
+    struct handlebars_map * map
+)
+{
+    if( map == prev_map ) {
+        return map;
+    }
+
+#ifndef HANDLEBARS_NO_REFCOUNT
+    if (handlebars_rc_refcount(&prev_map->rc) >= 1) { // ugh
+        handlebars_map_addref(map);
+    }
+#endif
+    handlebars_map_delref(prev_map);
+    return map;
+}
+
+static void map_add_init(
+    struct map_mutation_state * state,
+    struct handlebars_string * key,
+    struct handlebars_value * value
+)
+{
+    struct ht_find_result o = map_find_entry(state->original, key);
     struct handlebars_value value_copy;
 
     /* Reject duplicates before rehashing. If the error is caught by the
      * caller, its map pointer must still refer to the original live map. */
     if( unlikely(o.entry_found) ) {
-        handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Failed to add to hash table");
+        handlebars_throw(state->original->ctx, HANDLEBARS_ERROR, "Failed to add to hash table");
     }
 
     /* The source may point into this map. Preserve its bytes before a rehash
      * replaces the map; copied entries keep referenced payloads alive. */
     value_copy = *value;
 
-    // Rehash
-    map = handlebars_map_rehash(map, false);
+    state->map = map_rehash_prepare(state->original, false);
 
     // Add
-    o = map_find_entry(map, key);
+    o = map_find_entry(state->map, key);
     if( unlikely(o.entry_found || !o.empty_found) ) {
         // this should never happen - unless rehash locked due to iteration
+        handlebars_throw(state->original->ctx, HANDLEBARS_ERROR, "Failed to add to hash table");
+    }
+
+    map_add_at_table_offset(state->map, key, &value_copy, o.empty_offset);
+    state->map = map_rehash_commit(state->original, state->map);
+}
+
+HBS_ATTR_NOINLINE
+static struct handlebars_map * map_add_guarded(
+    struct map_mutation_state * state,
+    struct handlebars_string * key,
+    struct handlebars_value * value
+)
+{
+    struct handlebars_error * error = state->original->ctx->e;
+    jmp_buf * volatile previous = error->jmp;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(state->original->ctx, &buf) ) {
+        error->jmp = previous;
+        if( state->map != state->original ) {
+            map_unpublished_dtor(state->map);
+            state->map = state->original;
+        }
+        map_rethrow(state->original->ctx, previous);
+    }
+
+    map_add_init(state, key, value);
+    error->jmp = previous;
+    return state->map;
+}
+
+struct handlebars_map * handlebars_map_add(struct handlebars_map * map, struct handlebars_string * key, struct handlebars_value * value)
+{
+    struct ht_find_result o = map_find_entry(map, key);
+
+    if( unlikely(o.entry_found) ) {
         handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Failed to add to hash table");
     }
 
-    map_add_at_table_offset(map, key, &value_copy, o.empty_offset);
+    if( !map_rehash_required(map, false) ) {
+        struct handlebars_value value_copy = *value;
 
-    return map;
+        if( unlikely(!o.empty_found) ) {
+            handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Failed to add to hash table");
+        }
+        map_add_at_table_offset(map, key, &value_copy, o.empty_offset);
+        return map;
+    }
+
+    struct map_mutation_state state = {
+        .original = map,
+        .map = map
+    };
+
+    return map_add_guarded(&state, key, value);
 }
 
 struct handlebars_map * handlebars_map_remove(struct handlebars_map * map, struct handlebars_string * key)
 {
+    struct ht_find_result o = map_find_entry(map, key);
+
+    /* Removing a missing key is a no-op. In particular, do not allocate a
+     * replacement merely because an otherwise unchanged map has low load. */
+    if (!o.entry) {
+        return map;
+    }
+
     // Rehash
     map = handlebars_map_rehash(map, handlebars_map_load_factor(map) < HANDLEBARS_MAP_MIN_LOAD_FACTOR);
 
     // Remove
-    struct ht_find_result o = map_find_entry(map, key);
+    o = map_find_entry(map, key);
     struct handlebars_map_entry * entry = o.entry;
-    if (!entry) {
-        return map;
+    if( unlikely(entry == NULL) ) {
+        handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Failed to find map entry after rehash");
     }
 
     handlebars_string_delref(entry->key);
@@ -492,37 +801,96 @@ struct handlebars_value * handlebars_map_find(struct handlebars_map * map, struc
     }
 }
 
-struct handlebars_map * handlebars_map_update(struct handlebars_map * map, struct handlebars_string * key, struct handlebars_value * value)
+static void map_update_init(
+    struct map_mutation_state * state,
+    struct handlebars_string * key,
+    struct handlebars_value * value
+)
 {
-    struct ht_find_result o = map_find_entry(map, key);
+    struct ht_find_result o = map_find_entry(state->original, key);
     struct handlebars_value value_copy;
 
     if( o.entry && &o.entry->value == value ) {
-        return map;
+        return;
     }
 
     /* The source value may be owned by the map that rehash replaces. */
     value_copy = *value;
 
-    // Rehash
-    map = handlebars_map_rehash(map, false);
+    state->map = map_rehash_prepare(state->original, false);
 
     // Update
-    o = map_find_entry(map, key);
+    o = map_find_entry(state->map, key);
     struct handlebars_map_entry * entry = o.entry;
     if (entry) {
         handlebars_value_value(&entry->value, &value_copy);
+    } else if( unlikely(!o.empty_found) ) {
+        // This should never happen
+        handlebars_throw(state->original->ctx, HANDLEBARS_ERROR, "Failed to update to hash table");
+    } else {
+        map_add_at_table_offset(
+            state->map,
+            key,
+            &value_copy,
+            o.empty_offset
+        );
+    }
+
+    state->map = map_rehash_commit(state->original, state->map);
+}
+
+HBS_ATTR_NOINLINE
+static struct handlebars_map * map_update_guarded(
+    struct map_mutation_state * state,
+    struct handlebars_string * key,
+    struct handlebars_value * value
+)
+{
+    struct handlebars_error * error = state->original->ctx->e;
+    jmp_buf * volatile previous = error->jmp;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(state->original->ctx, &buf) ) {
+        error->jmp = previous;
+        if( state->map != state->original ) {
+            map_unpublished_dtor(state->map);
+            state->map = state->original;
+        }
+        map_rethrow(state->original->ctx, previous);
+    }
+
+    map_update_init(state, key, value);
+    error->jmp = previous;
+    return state->map;
+}
+
+struct handlebars_map * handlebars_map_update(struct handlebars_map * map, struct handlebars_string * key, struct handlebars_value * value)
+{
+    struct ht_find_result o = map_find_entry(map, key);
+
+    if( o.entry && &o.entry->value == value ) {
         return map;
     }
 
-    if( unlikely(!o.empty_found) ) {
-        // This should never happen
-        handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Failed to update to hash table");
+    if( !map_rehash_required(map, false) ) {
+        struct handlebars_value value_copy = *value;
+
+        if( o.entry ) {
+            handlebars_value_value(&o.entry->value, &value_copy);
+        } else if( unlikely(!o.empty_found) ) {
+            handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Failed to update to hash table");
+        } else {
+            map_add_at_table_offset(map, key, &value_copy, o.empty_offset);
+        }
+        return map;
     }
 
-    map_add_at_table_offset(map, key, &value_copy, o.empty_offset);
+    struct map_mutation_state state = {
+        .original = map,
+        .map = map
+    };
 
-    return map;
+    return map_update_guarded(&state, key, value);
 }
 
 extern inline size_t handlebars_map_count(struct handlebars_map * map) {
@@ -561,33 +929,18 @@ bool handlebars_map_is_sparse(struct handlebars_map * map)
 
 struct handlebars_map * handlebars_map_rehash(struct handlebars_map * map, bool force)
 {
-    if (map->is_in_iteration) { // this go go really wrong
-        return map;
-    }
+    struct handlebars_map * prev_map = map;
 
-#ifndef HANDLEBARS_NO_REFCOUNT
-    if (handlebars_rc_refcount(&map->rc) > 1) {
-        force = true;
-    }
-#endif
-
-    if (force || map->vec_offset == map->vec_capacity || handlebars_map_load_factor(map) > HANDLEBARS_MAP_MAX_LOAD_FACTOR) {
-        size_t vec_capacity = (size_t) 1 << map_choose_vec_capacity_log2(map->i + 1);
-        struct handlebars_map * prev_map = map;
-        map = handlebars_map_copy_ctor(prev_map, vec_capacity);
-#ifndef HANDLEBARS_NO_REFCOUNT
-        if (handlebars_rc_refcount(&prev_map->rc) >= 1) { // ugh
-            handlebars_map_addref(map);
-        }
-#endif
-        handlebars_map_delref(prev_map);
-    }
-
-    return map;
+    map = map_rehash_prepare(prev_map, force);
+    return map_rehash_commit(prev_map, map);
 }
 
 void handlebars_map_sparse_array_compact(struct handlebars_map * map)
 {
+    if( map_in_place_mutation_is_locked(map) ) {
+        return;
+    }
+
     // nothing to do
     if (map->i == map->vec_offset) {
         return;
@@ -654,6 +1007,9 @@ static int map_entry_compare(const void * ptr1, const void * ptr2, void * arg)
 
 struct handlebars_map * handlebars_map_sort(struct handlebars_map * map, handlebars_map_kv_compare_func compare)
 {
+    if( unlikely(map_in_place_mutation_is_locked(map)) ) {
+        handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Cannot sort a map during iteration");
+    }
     map = handlebars_map_rehash(map, handlebars_map_is_sparse(map));
 
     struct handlebars_map_entry * vec = map_vec(map);
@@ -691,6 +1047,9 @@ struct handlebars_map * handlebars_map_sort_r(
     handlebars_map_kv_compare_r_func compare,
     const void * arg
 ) {
+    if( unlikely(map_in_place_mutation_is_locked(map)) ) {
+        handlebars_throw(map->ctx, HANDLEBARS_ERROR, "Cannot sort a map during iteration");
+    }
     map = handlebars_map_rehash(map, handlebars_map_is_sparse(map));
 
     struct map_sort_r_arg sort_r_arg = {compare, arg};
@@ -707,22 +1066,84 @@ struct handlebars_map * handlebars_map_sort_r(
 
 // compat
 
+static void map_release_temporary_string(struct handlebars_string * string)
+{
+#ifdef HANDLEBARS_NO_REFCOUNT
+    handlebars_talloc_free(string);
+#else
+    handlebars_string_delref(string);
+#endif
+}
+
+enum map_string_mutation {
+    MAP_STRING_REMOVE,
+    MAP_STRING_ADD,
+    MAP_STRING_UPDATE
+};
+
+struct map_string_mutation_state {
+    struct handlebars_map * map;
+    struct handlebars_string * string;
+};
+
+HBS_ATTR_NOINLINE
+static struct handlebars_map * map_string_mutation_guarded(
+    struct map_string_mutation_state * state,
+    enum map_string_mutation mutation,
+    struct handlebars_value * value
+)
+{
+    struct handlebars_error * error = state->map->ctx->e;
+    jmp_buf * volatile previous = error->jmp;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(state->map->ctx, &buf) ) {
+        error->jmp = previous;
+        map_release_temporary_string(state->string);
+        state->string = NULL;
+        map_rethrow(state->map->ctx, previous);
+    }
+
+    switch( mutation ) {
+        case MAP_STRING_REMOVE:
+            state->map = handlebars_map_remove(state->map, state->string);
+            break;
+        case MAP_STRING_ADD:
+            state->map = handlebars_map_add(state->map, state->string, value);
+            break;
+        case MAP_STRING_UPDATE:
+            state->map = handlebars_map_update(state->map, state->string, value);
+            break;
+        default:
+            abort();
+    }
+
+    map_release_temporary_string(state->string);
+    state->string = NULL;
+    error->jmp = previous;
+    return state->map;
+}
+
 struct handlebars_map * handlebars_map_str_remove(struct handlebars_map * map, const char * key, size_t len)
 {
-    struct handlebars_string * string = handlebars_string_ctor(CONTEXT, key, len);
-    handlebars_string_addref(string);
-    map = handlebars_map_remove(map, string);
-    handlebars_string_delref(string);
-    return map;
+    struct map_string_mutation_state state = {
+        .map = map,
+        .string = handlebars_string_ctor(CONTEXT, key, len)
+    };
+
+    handlebars_string_addref(state.string);
+    return map_string_mutation_guarded(&state, MAP_STRING_REMOVE, NULL);
 }
 
 struct handlebars_map * handlebars_map_str_add(struct handlebars_map * map, const char * key, size_t len, struct handlebars_value * value)
 {
-    struct handlebars_string * string = handlebars_string_ctor(CONTEXT, key, len);
-    handlebars_string_addref(string);
-    map = handlebars_map_add(map, string, value);
-    handlebars_string_delref(string);
-    return map;
+    struct map_string_mutation_state state = {
+        .map = map,
+        .string = handlebars_string_ctor(CONTEXT, key, len)
+    };
+
+    handlebars_string_addref(state.string);
+    return map_string_mutation_guarded(&state, MAP_STRING_ADD, value);
 }
 
 struct handlebars_value * handlebars_map_str_find(struct handlebars_map * map, const char * key, size_t len)
@@ -730,15 +1151,17 @@ struct handlebars_value * handlebars_map_str_find(struct handlebars_map * map, c
     struct handlebars_string * string = handlebars_string_ctor(CONTEXT, key, len);
     handlebars_string_addref(string);
     struct handlebars_value * value = handlebars_map_find(map, string);
-    handlebars_string_delref(string);
+    map_release_temporary_string(string);
     return value;
 }
 
 struct handlebars_map * handlebars_map_str_update(struct handlebars_map * map, const char * key, size_t len, struct handlebars_value * value)
 {
-    struct handlebars_string * string = handlebars_string_ctor(CONTEXT, key, len);
-    handlebars_string_addref(string);
-    map = handlebars_map_update(map, string, value);
-    handlebars_string_delref(string);
-    return map;
+    struct map_string_mutation_state state = {
+        .map = map,
+        .string = handlebars_string_ctor(CONTEXT, key, len)
+    };
+
+    handlebars_string_addref(state.string);
+    return map_string_mutation_guarded(&state, MAP_STRING_UPDATE, value);
 }

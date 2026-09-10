@@ -20,10 +20,13 @@
 #endif
 
 #include <check.h>
+#include <locale.h>
+#include <stdlib.h>
 #include <string.h>
 #include <talloc.h>
 
 #define HANDLEBARS_OPCODES_PRIVATE
+#define HANDLEBARS_COMPILER_PRIVATE
 
 #include "handlebars.h"
 #include "handlebars_compiler.h"
@@ -68,6 +71,57 @@ START_TEST(test_operand_print_append_long)
     ck_assert_ptr_ne(NULL, string);
     ck_assert_str_eq("[LONG:2358]", hbs_str_val(string));
     handlebars_talloc_free(string);
+}
+END_TEST
+
+START_TEST(test_operand_print_append_double)
+{
+    struct handlebars_operand op;
+    struct handlebars_string * string;
+    handlebars_operand_set_doubleval(&op, -12.5);
+    string = handlebars_operand_print(context, &op);
+    ck_assert_ptr_ne(NULL, string);
+    ck_assert_str_eq("[DOUBLE:-12.5]", hbs_str_val(string));
+    handlebars_talloc_free(string);
+}
+END_TEST
+
+START_TEST(test_operand_print_append_double_preserves_round_trip_value)
+{
+    const double expected = 1.234567890123456;
+    struct handlebars_operand op;
+    struct handlebars_string * string;
+    char * end;
+    double actual;
+
+    ck_assert_ptr_nonnull(setlocale(LC_NUMERIC, "C"));
+    handlebars_operand_set_doubleval(&op, expected);
+    string = handlebars_operand_print(context, &op);
+    ck_assert_ptr_nonnull(string);
+    ck_assert_uint_ge(hbs_str_len(string), sizeof("[DOUBLE:]") - 1);
+    ck_assert_int_eq(strncmp(hbs_str_val(string), "[DOUBLE:", 8), 0);
+    actual = strtod(hbs_str_val(string) + 8, &end);
+    ck_assert_int_eq(*end, ']');
+    ck_assert_double_eq(actual, expected);
+    handlebars_talloc_free(string);
+}
+END_TEST
+
+START_TEST(test_operand_print_append_double_ignores_process_locale)
+{
+    struct handlebars_operand op;
+    struct handlebars_string * string;
+    char * saved_locale = activate_comma_decimal_locale();
+
+    if( saved_locale == NULL ) {
+        return;
+    }
+    handlebars_operand_set_doubleval(&op, 1.25);
+    string = handlebars_operand_print(context, &op);
+    ck_assert_ptr_ne(NULL, string);
+    ck_assert_str_eq("[DOUBLE:1.25]", hbs_str_val(string));
+    handlebars_talloc_free(string);
+    restore_numeric_locale(saved_locale);
 }
 END_TEST
 
@@ -149,6 +203,103 @@ START_TEST(test_opcode_print_4)
 }
 END_TEST
 
+START_TEST(test_opcode_print_register_decorator)
+{
+    struct handlebars_opcode * opcode = handlebars_opcode_ctor(context, handlebars_opcode_type_register_decorator);
+    struct handlebars_string * string;
+    const char * expected[] = {
+        "registerDecorator[LONG:1][STRING:inline]",
+        "registerDecorator[LONG:1][STRING:inline][BOOLEAN:0]",
+        "registerDecorator[LONG:1][STRING:inline][BOOLEAN:1]"
+    };
+
+    ck_assert_int_eq(handlebars_opcode_num_operands(opcode->type), 3);
+    handlebars_operand_set_longval(&opcode->op1, 1);
+    handlebars_operand_set_stringval(context, opcode, &opcode->op2, handlebars_string_ctor(context, HBS_STRL("inline")));
+    for( size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++ ) {
+        if( i != 0 ) {
+            handlebars_operand_set_boolval(&opcode->op3, i == 2);
+        }
+        string = handlebars_opcode_print(context, opcode, 0);
+        ck_assert_str_eq(hbs_str_val(string), expected[i]);
+        handlebars_talloc_free(string);
+    }
+    handlebars_talloc_free(opcode);
+}
+END_TEST
+
+START_TEST(test_program_print_separators)
+{
+    struct handlebars_opcode * root_opcodes[] = {
+        handlebars_opcode_ctor(context, handlebars_opcode_type_append_content),
+        handlebars_opcode_ctor(context, handlebars_opcode_type_append)
+    };
+    struct handlebars_opcode * child_opcodes[] = {
+        handlebars_opcode_ctor(context, handlebars_opcode_type_return)
+    };
+    struct handlebars_opcode * decorator_opcodes[] = {
+        handlebars_opcode_ctor(context, handlebars_opcode_type_append_escaped)
+    };
+    struct handlebars_program child = {.opcodes = child_opcodes, .opcodes_length = 1};
+    struct handlebars_program decorator = {.opcodes = decorator_opcodes, .opcodes_length = 1};
+    struct handlebars_program * children[] = {&child};
+    struct handlebars_program * decorators[] = {&decorator};
+    struct handlebars_program program = {
+        .opcodes = root_opcodes, .opcodes_length = 2,
+        .children = children, .children_length = 1,
+        .decorators = decorators, .decorators_length = 1
+    };
+    struct handlebars_string * string;
+
+    handlebars_operand_set_stringval(context, root_opcodes[0], &root_opcodes[0]->op1,
+        handlebars_string_ctor(context, HBS_STRL("root\ntext")));
+
+    string = handlebars_program_print(context, &program, 0);
+    ck_assert_str_eq(hbs_str_val(string),
+        "appendContent[STRING:root\\ntext]\nappend\n-----\n"
+        "  DECORATOR\n  appendEscaped\n  -----\n  return\n  -----\n");
+    handlebars_talloc_free(string);
+
+    string = handlebars_program_print(context, &program, handlebars_opcode_printer_flag_no_newlines);
+    ck_assert_str_eq(hbs_str_val(string),
+        "appendContent[STRING:root\\ntext] append ----- "
+        "  DECORATOR   appendEscaped   -----   return   ----- ");
+    handlebars_talloc_free(string);
+    handlebars_talloc_free(root_opcodes[0]);
+    handlebars_talloc_free(root_opcodes[1]);
+    handlebars_talloc_free(child_opcodes[0]);
+    handlebars_talloc_free(decorator_opcodes[0]);
+}
+END_TEST
+
+START_TEST(test_program_print_empty_separators)
+{
+    struct handlebars_program program = {0};
+    struct handlebars_string * string = handlebars_program_print(context, &program, 0);
+    ck_assert_str_eq(hbs_str_val(string), "-----\n");
+    handlebars_talloc_free(string);
+    string = handlebars_program_print(context, &program, handlebars_opcode_printer_flag_no_newlines);
+    ck_assert_str_eq(hbs_str_val(string), "----- ");
+    handlebars_talloc_free(string);
+}
+END_TEST
+
+START_TEST(test_program_print_locations_without_newlines)
+{
+    struct handlebars_opcode * opcode = handlebars_opcode_ctor(context, handlebars_opcode_type_append);
+    struct handlebars_program program = {.opcodes = &opcode, .opcodes_length = 1};
+    struct handlebars_locinfo loc = {1, 2, 3, 4};
+    struct handlebars_string * string;
+
+    handlebars_opcode_set_loc(opcode, loc);
+    string = handlebars_program_print(context, &program,
+        handlebars_opcode_printer_flag_no_newlines | handlebars_opcode_printer_flag_locations);
+    ck_assert_str_eq(hbs_str_val(string), "append [1:2-3:4] ----- ");
+    handlebars_talloc_free(string);
+    handlebars_talloc_free(opcode);
+}
+END_TEST
+
 static Suite * suite(void);
 static Suite * suite(void)
 {
@@ -157,12 +308,19 @@ static Suite * suite(void)
     REGISTER_TEST_FIXTURE(s, test_operand_print_append_null, "Operand Print Append (null)");
     REGISTER_TEST_FIXTURE(s, test_operand_print_append_boolean, "Operand Print Append (boolean)");
     REGISTER_TEST_FIXTURE(s, test_operand_print_append_long, "Operand Print Append (long)");
+    REGISTER_TEST_FIXTURE(s, test_operand_print_append_double, "Operand Print Append (double)");
+    REGISTER_TEST_FIXTURE(s, test_operand_print_append_double_preserves_round_trip_value, "Operand Print Append (double round trip)");
+    REGISTER_TEST_FIXTURE(s, test_operand_print_append_double_ignores_process_locale, "Operand Print Append (double, non-C locale)");
     REGISTER_TEST_FIXTURE(s, test_operand_print_append_string, "Operand Print Append (string)");
     REGISTER_TEST_FIXTURE(s, test_operand_print_append_array, "Operand Print Append (array)");
     REGISTER_TEST_FIXTURE(s, test_opcode_print_1, "Opcode Print (1)");
     REGISTER_TEST_FIXTURE(s, test_opcode_print_2, "Opcode Print (2)");
     REGISTER_TEST_FIXTURE(s, test_opcode_print_3, "Opcode Print (3)");
     REGISTER_TEST_FIXTURE(s, test_opcode_print_4, "Opcode Print (4)");
+    REGISTER_TEST_FIXTURE(s, test_opcode_print_register_decorator, "Print decorator registration operands");
+    REGISTER_TEST_FIXTURE(s, test_program_print_separators, "Program separators with children and decorators");
+    REGISTER_TEST_FIXTURE(s, test_program_print_empty_separators, "Empty program separators");
+    REGISTER_TEST_FIXTURE(s, test_program_print_locations_without_newlines, "Program locations without newlines");
 
     return s;
 }

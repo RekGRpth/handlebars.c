@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.5)
+project(handlebars_installed_config C)
+
+add_executable(test_installed_config main.c)
+target_include_directories(test_installed_config PRIVATE "${HEADER_DIR}")
+target_link_libraries(test_installed_config PRIVATE "${HANDLEBARS_LIBRARY}")
+foreach(feature JSON LMDB PCRE PTHREAD YAML MEMORY TESTING_EXPORTS)
+    target_compile_definitions(test_installed_config PRIVATE
+        "EXPECT_${feature}=${EXPECT_${feature}}")
+endforeach()
+
+enable_testing()
+add_test(NAME installed_config COMMAND test_installed_config)
+
+if(HANDLEBARS_EXPORT)
+    include("${HANDLEBARS_EXPORT}")
+    foreach(library handlebars handlebars_static)
+        get_target_property(dependencies ${library} INTERFACE_LINK_LIBRARIES)
+        foreach(dependency ${dependencies})
+            if(dependency MATCHES "(^|[/;:])(lib)?(check|check_pic|pcre2-8|pcre2-8-static)([.>;]|$)")
+                message(FATAL_ERROR "${library} exposes a test dependency: ${dependency}")
+            endif()
+        endforeach()
+        add_executable(test_installed_config_${library} target.c)
+        target_link_libraries(test_installed_config_${library} PRIVATE ${library})
+        foreach(feature JSON LMDB YAML MEMORY)
+            target_compile_definitions(test_installed_config_${library} PRIVATE
+                "EXPECT_${feature}=${EXPECT_${feature}}")
+        endforeach()
+        add_test(NAME installed_config_${library} COMMAND test_installed_config_${library})
+    endforeach()
+endif()

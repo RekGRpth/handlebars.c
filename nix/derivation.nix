@@ -23,7 +23,7 @@
   check,
   subunit,
   bats,
-  pcre,
+  pcre2,
   # testing deps
   autoconf-archive,
   bison,
@@ -53,6 +53,7 @@
   jsonSupport ? true,
   lmdbSupport ? true,
   ltoSupport ? false,
+  memoryTestingSupport ? false,
   noRefcountingSupport ? false,
   pthreadSupport ? true,
   sharedSupport ? true,
@@ -94,7 +95,7 @@ stdenv.mkDerivation rec {
 
   buildInputs =
     [glib]
-    ++ lib.optional checkSupport pcre
+    ++ lib.optional checkSupport pcre2
     ++ lib.optional jsonSupport json_c
     ++ lib.optional lmdbSupport lmdb
     ++ lib.optional yamlSupport libyaml;
@@ -140,6 +141,8 @@ stdenv.mkDerivation rec {
     # not sure if this is a good idea, but I don't think it'll work without it
     ++ lib.optionals ltoSupport ["RANLIB=" "AR=" "NM=" "LD="]
     ++ lib.optional (!ltoSupport) "--disable-lto"
+    ++ lib.optional memoryTestingSupport "--enable-handlebars-memory"
+    ++ lib.optional (!memoryTestingSupport) "--disable-handlebars-memory"
     ++ lib.optional noRefcountingSupport "--disable-refcounting"
     ++ lib.optional pthreadSupport "--enable-pthread"
     ++ lib.optional (!pthreadSupport) "--disable-pthread"
@@ -158,19 +161,30 @@ stdenv.mkDerivation rec {
     []
     ++ lib.optional debugSupport "-DCMAKE_BUILD_TYPE=Debug"
     ++ lib.optional (!debugSupport) "-DCMAKE_BUILD_TYPE=Release"
-    ++ lib.optional checkSupport "-DHANDLEBARS_ENABLE_TESTS=1";
+    ++ lib.optional checkSupport "-DHANDLEBARS_ENABLE_TESTS=1"
+    ++ lib.optional memoryTestingSupport "-DHANDLEBARS_ENABLE_MEMORY=1";
 
-  preConfigure = lib.optionalString checkSupport ''
-    patchShebangs ./bench/run.sh
-    patchShebangs ./tests/test_executable.bats
-    export handlebars_export_dir=${handlebars_spec}/share/handlebars-spec/export/
-    export handlebars_spec_dir=${handlebars_spec}/share/handlebars-spec/spec/
-    export handlebars_tokenizer_spec=${handlebars_spec}/share/handlebars-spec/spec/tokenizer.json
-    export handlebars_parser_spec=${handlebars_spec}/share/handlebars-spec/spec/parser.json
-    export mustache_spec_dir=${mustache_spec}/specs
-  '';
+  preConfigure =
+    lib.optionalString checkSupport ''
+      patchShebangs ./bench/run.sh
+      patchShebangs ./tests/test_executable.bats
+      export handlebars_export_dir=${handlebars_spec}/share/handlebars-spec/export/
+      export handlebars_spec_dir=${handlebars_spec}/share/handlebars-spec/spec/
+      export handlebars_tokenizer_spec=${handlebars_spec}/share/handlebars-spec/spec/tokenizer.json
+      export handlebars_parser_spec=${handlebars_spec}/share/handlebars-spec/spec/parser.json
+      export mustache_spec_dir=${mustache_spec}/specs
+    ''
+    + lib.optionalString (cmakeSupport && (!jsonSupport || !yamlSupport)) ''
+      cp src/handlebars_config.h.in src/handlebars_config.h
+      substituteInPlace src/handlebars_config.h \
+        --replace-fail '#undef HANDLEBARS_HAVE_JSON' '#define HANDLEBARS_HAVE_JSON 1' \
+        --replace-fail '#undef HANDLEBARS_HAVE_YAML' '#define HANDLEBARS_HAVE_YAML 1'
+    '';
 
   doCheck = checkSupport;
+  preCheck = lib.optionalString (cmakeSupport && memoryTestingSupport) ''
+    ctest -R '^test_random_alloc_fail$' --output-on-failure --no-tests=error
+  '';
   checkTarget =
     if cmakeSupport
     then "test"

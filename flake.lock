@@ -1,5 +1,32 @@
 {
   "nodes": {
+    "agent-badge": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "gitignore": [
+          "gitignore"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788683347,
+        "narHash": "sha256-fcFq4zYo8VKZHoYVc53s85vWyZpZGMgQUmqlbtPcV4w=",
+        "owner": "jbboehr",
+        "repo": "agent-badge.ts",
+        "rev": "c00276270b0546a9c3c22ac54d7e258ae2dbf4e6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jbboehr",
+        "ref": "master",
+        "repo": "agent-badge.ts",
+        "type": "github"
+      }
+    },
     "flake-compat": {
       "flake": false,
       "locked": {
@@ -58,32 +85,30 @@
     },
     "handlebars_spec": {
       "inputs": {
-        "flake-utils": [
-          "flake-utils"
+        "agent-badge": [
+          "agent-badge"
         ],
-        "gitignore": [
-          "gitignore"
+        "git-hooks": [
+          "pre-commit-hooks"
         ],
         "nixpkgs": [
           "nixpkgs"
-        ],
-        "pre-commit-hooks": [
-          "pre-commit-hooks"
         ],
         "systems": [
           "systems"
         ]
       },
       "locked": {
-        "lastModified": 1727508389,
-        "narHash": "sha256-1RdK24zzzYpY/u/R+kTktIjgBpfig8s5dxGx2mr8jRs=",
+        "lastModified": 1788711980,
+        "narHash": "sha256-j/vUhgwxJiLYZbkAQ1GrJZoY/wWTSvfSo+hbpjP1XGU=",
         "owner": "jbboehr",
         "repo": "handlebars-spec",
-        "rev": "0fbf7ecdcd7ed789139f475fd40bfcf0520b0e9a",
+        "rev": "af6d944d3a750d3ef3b6bca3791fd06322826e6d",
         "type": "github"
       },
       "original": {
         "owner": "jbboehr",
+        "ref": "master",
         "repo": "handlebars-spec",
         "type": "github"
       }
@@ -164,6 +189,7 @@
     },
     "root": {
       "inputs": {
+        "agent-badge": "agent-badge",
         "flake-utils": "flake-utils",
         "gitignore": "gitignore",
         "handlebars_spec": "handlebars_spec",

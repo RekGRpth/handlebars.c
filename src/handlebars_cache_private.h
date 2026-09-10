@@ -83,4 +83,58 @@ struct handlebars_cache {
     size_t max_size;
 };
 
+struct handlebars_cache_try_guard {
+    struct handlebars_error * error;
+    void * entry;
+    bool locked;
+};
+
+HBS_LOCAL enum handlebars_error_type handlebars_cache_try_guard_begin(
+    struct handlebars_error * error,
+    struct handlebars_cache_try_guard * guard
+);
+
+HBS_LOCAL enum handlebars_error_type handlebars_cache_try_guard_try_begin(
+    struct handlebars_error * error,
+    struct handlebars_cache_try_guard * guard,
+    bool * acquired
+);
+
+HBS_LOCAL enum handlebars_error_type handlebars_cache_try_guard_end(
+    struct handlebars_cache_try_guard * guard
+);
+
+HBS_LOCAL enum handlebars_error_type handlebars_cache_find_try_with_error_context(
+    struct handlebars_cache * cache,
+    struct handlebars_string * key,
+    struct handlebars_module ** result,
+    struct handlebars_context * error_context
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL enum handlebars_error_type handlebars_cache_add_try_with_error_context(
+    struct handlebars_cache * cache,
+    struct handlebars_string * key,
+    struct handlebars_module * module,
+    struct handlebars_context * error_context
+) HBS_ATTR_NONNULL_ALL;
+
+HBS_LOCAL enum handlebars_error_type handlebars_cache_release_try_with_error_context(
+    struct handlebars_cache * cache,
+    struct handlebars_string * key,
+    struct handlebars_module * module,
+    struct handlebars_context * error_context
+) HBS_ATTR_NONNULL_ALL;
+
+#if defined(HANDLEBARS_HAVE_PTHREAD) && defined(HANDLEBARS_TESTING_EXPORTS)
+HBS_TEST_PUBLIC extern int (*handlebars_cache_mmap_mprotect)(
+    void * address,
+    size_t length,
+    int protection
+);
+
+HBS_TEST_PUBLIC bool handlebars_cache_mmap_is_resetting(
+    struct handlebars_cache * cache
+) HBS_ATTR_NONNULL_ALL;
+#endif
+
 #endif /* HANDLEBARS_CACHE_PRIVATE_H */

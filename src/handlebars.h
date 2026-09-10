@@ -32,7 +32,7 @@
 #include <stdint.h>
 #include <setjmp.h>
 
-#include "handlebars_config.h"
+#include <handlebars_config.h>
 
 #ifdef	__cplusplus
 #define HBS_EXTERN_C_START extern "C" {
@@ -179,7 +179,10 @@ enum handlebars_error_type
     HANDLEBARS_STACK_OVERFLOW = 7,
 
     //! A helper caused an error or exception
-    HANDELBARS_EXTERNAL_ERROR = 8
+    HANDELBARS_EXTERNAL_ERROR = 8,
+
+    //! An operation does not support the value's native storage type
+    HANDLEBARS_TYPE_ERROR = 9
 };
 
 /**
@@ -193,12 +196,16 @@ struct handlebars_locinfo
     int last_column;
 };
 
+struct handlebars_value_iterator;
+
 struct handlebars_error
 {
     //! The type of error that has occurred
     enum handlebars_error_type num;
 
-    //! The message of the error that has occurred
+    //! The message of the error that has occurred; dynamically formatted
+    //! messages are owned by this error object and replaced by the next error.
+    //! Callers must not modify or free this pointer.
     const char * msg;
 
     //! The location of the error that has occurred
@@ -207,10 +214,19 @@ struct handlebars_error
     //! On an unrecoverable error, if `jmp` is non-null, `longjmp` will be called with it as an argument,
     //! otherwise `abort`
     jmp_buf * jmp;
+
+    //! Active value iterators that must be closed when unwinding to `jmp`
+    struct handlebars_value_iterator * iterator_cleanup;
 };
 
 /**
- * @brief Common structure header, used to store error info and a `jmp_buf`
+ * @brief Common structure header for an allocation and error domain.
+ *
+ * A context owns one mutable error state. Parsers, compilers, VMs, and caches
+ * constructed directly from the same context bind to that state. A VM must not
+ * be used concurrently, and separate objects that share a context are not
+ * independent error domains. Use a separate context and VM for each concurrent
+ * request or worker.
  */
 struct handlebars_context
 {
@@ -246,7 +262,13 @@ const char * handlebars_mustache_spec_version_string(void)
     HBS_ATTR_RETURNS_NONNULL HBS_ATTR_CONST;
 
 /**
- * @brief Construct a context object. Used as the root talloc pointer.
+ * @brief Construct a context with an independent error state.
+ *
+ * @p ctx controls talloc ownership only. The new context does not share its
+ * error state with that parent. Reference counts do not allow allocations to
+ * outlive this talloc ownership tree. See `docs/ownership.md` in the source
+ * distribution for the complete ownership model.
+ *
  * @param[in] ctx The talloc memory context
  * @return the context pointer
  */
@@ -254,12 +276,19 @@ struct handlebars_context * handlebars_context_ctor_ex(void * ctx)
     HBS_ATTR_WARN_UNUSED_RESULT;
 
 /**
- * @brief Construct a root context object. Used as the root talloc pointer.
+ * @brief Construct a root context with an independent error state.
  * @return the context pointer
  */
 struct handlebars_context * handlebars_context_ctor(void)
     HBS_ATTR_WARN_UNUSED_RESULT;
 
+/**
+ * @brief Bind a child object to its parent's error state.
+ *
+ * The child must not already have an error state. Bound objects share mutable
+ * diagnostics and an internal jump target, so their operations must not run
+ * concurrently unless the specific API documents otherwise.
+ */
 void handlebars_context_bind(
     struct handlebars_context * parent,
     struct handlebars_context * child
@@ -325,25 +354,40 @@ struct handlebars_locinfo handlebars_error_loc(
 /**
  * @brief Get the error message for the specified context
  * @param[in] context The handlebars context
- * @return The error message, or NULL if no error has occurred.
+ * @return A borrowed error message, or NULL if no error has occurred. The
+ *         pointer is invalidated by the next error, #handlebars_error_clear,
+ *         or context destruction.
  */
 const char * handlebars_error_msg(
     struct handlebars_context * context
 ) HBS_ATTR_NONNULL_ALL;
 
 /**
- * @brief Get a copy the error message from a context, or NULL.
+ * @brief Clear the current error code, message, and location.
+ *
+ * The active error jump target and iterator cleanup state are preserved.
+ *
  * @param[in] context The handlebars context
- * @return The error message
+ */
+void handlebars_error_clear(
+    struct handlebars_context * context
+) HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Get a copy of the error message from a context, or NULL.
+ * @param[in] context The handlebars context
+ * @return A context-owned copy of the error message, or NULL if no error has
+ *         occurred or the copy could not be allocated
  */
 char * handlebars_error_message(
     struct handlebars_context * context
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
 
 /**
- * @brief Get a copy the error message from a context, or NULL (compatibility for handlebars specification)
+ * @brief Get a copy of the error message from a context, or NULL (compatibility for handlebars specification)
  * @param[in] context
- * @return the error message
+ * @return A context-owned copy of the error message, or NULL if no error has
+ *         occurred or the copy could not be allocated
  */
 char * handlebars_error_message_js(
     struct handlebars_context * context

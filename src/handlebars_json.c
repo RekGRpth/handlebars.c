@@ -20,17 +20,13 @@
 #endif
 
 #include <assert.h>
+#include <limits.h>
 #include <string.h>
 #include <talloc.h>
 
-// json-c undeprecated json_object_object_get, but the version in xenial
-// is too old, so let's silence deprecated warnings for json-c
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include <json.h>
 #include <json_object.h>
 #include <json_tokener.h>
-#pragma GCC diagnostic pop
 
 #include "handlebars.h"
 #include "handlebars_memory.h"
@@ -58,6 +54,64 @@ struct handlebars_json {
     struct handlebars_user user;
     struct json_object * object;
 };
+
+struct handlebars_json_traversal {
+    struct handlebars_context * context;
+    struct json_object * active[HANDLEBARS_VALUE_MAX_DEPTH];
+    size_t active_count;
+};
+
+enum handlebars_json_try_operation {
+    handlebars_json_try_object,
+    handlebars_json_try_string
+};
+
+struct handlebars_json_try_state {
+    struct handlebars_value value;
+    enum handlebars_json_try_operation operation;
+    struct json_object * object;
+    const char * json;
+    size_t length;
+};
+
+static void hbs_json_validate_traversal(
+    struct json_object * object,
+    struct handlebars_json_traversal * state
+) {
+    enum json_type type = json_object_get_type(object);
+
+    if( type != json_type_object && type != json_type_array ) {
+        return;
+    }
+    for( size_t i = 0; i < state->active_count; i++ ) {
+        if( unlikely(state->active[i] == object) ) {
+            handlebars_throw(state->context, HANDLEBARS_ERROR, "Cyclic JSON value reference");
+        }
+    }
+    if( unlikely(state->active_count >= HANDLEBARS_VALUE_MAX_DEPTH) ) {
+        handlebars_throw(
+            state->context,
+            HANDLEBARS_ERROR,
+            "JSON value nesting exceeds the maximum depth of %d",
+            HANDLEBARS_VALUE_MAX_DEPTH
+        );
+    }
+
+    state->active[state->active_count++] = object;
+    if( type == json_type_object ) {
+        json_object_object_foreach(object, key, child) {
+            (void) key;
+            hbs_json_validate_traversal(child, state);
+        }
+    } else {
+        size_t count = json_object_array_length(object);
+
+        for( size_t i = 0; i < count; i++ ) {
+            hbs_json_validate_traversal(json_object_array_get_idx(object, i), state);
+        }
+    }
+    state->active_count--;
+}
 
 
 static int handlebars_json_dtor(struct handlebars_json * obj)
@@ -87,7 +141,7 @@ static void hbs_json_dtor(struct handlebars_user * user)
     }
 }
 
-static void hbs_json_convert(struct handlebars_value * value, bool recurse)
+static void hbs_json_convert_unchecked(struct handlebars_value * value, bool recurse)
 {
     struct handlebars_json * intern = GET_INTERN_V(value);
 
@@ -98,7 +152,7 @@ static void hbs_json_convert(struct handlebars_value * value, bool recurse)
                 HANDLEBARS_VALUE_DECL(new_value);
                 handlebars_value_init_json_object(intern->user.ctx, new_value, v);
                 if( recurse && handlebars_value_get_real_type(new_value) == HANDLEBARS_VALUE_TYPE_USER ) {
-                    hbs_json_convert(new_value, recurse);
+                    hbs_json_convert_unchecked(new_value, recurse);
                 }
                 map = handlebars_map_str_update(map, k, strlen(k), new_value);
                 HANDLEBARS_VALUE_UNDECL(new_value);
@@ -115,7 +169,7 @@ static void hbs_json_convert(struct handlebars_value * value, bool recurse)
                 HANDLEBARS_VALUE_DECL(new_value);
                 handlebars_value_init_json_object(intern->user.ctx, new_value, json_object_array_get_idx(intern->object, i));
                 if( recurse && handlebars_value_get_real_type(new_value) == HANDLEBARS_VALUE_TYPE_USER ) {
-                    hbs_json_convert(new_value, recurse);
+                    hbs_json_convert_unchecked(new_value, recurse);
                 }
                 stack = handlebars_stack_push(stack, new_value);
                 HANDLEBARS_VALUE_UNDECL(new_value);
@@ -126,6 +180,21 @@ static void hbs_json_convert(struct handlebars_value * value, bool recurse)
 
         default: break; // LCOV_EXCL_LINE
     }
+}
+
+static void hbs_json_convert(struct handlebars_value * value, bool recurse)
+{
+    struct handlebars_json * intern = GET_INTERN_V(value);
+
+    if( recurse ) {
+        struct handlebars_json_traversal state;
+
+        /* Validate API-constructed graphs before conversion mutates the value. */
+        state.context = intern->user.ctx;
+        state.active_count = 0;
+        hbs_json_validate_traversal(intern->object, &state);
+    }
+    hbs_json_convert_unchecked(value, recurse);
 }
 
 static enum handlebars_value_type hbs_json_type(struct handlebars_value * value)
@@ -145,8 +214,13 @@ static enum handlebars_value_type hbs_json_type(struct handlebars_value * value)
 static struct handlebars_value * hbs_json_map_find(struct handlebars_value * value, struct handlebars_string * key, struct handlebars_value * rv)
 {
     struct handlebars_json * intern = GET_INTERN_V(value);
-    struct json_object * item = json_object_object_get(intern->object, hbs_str_val(key));
-    if( item == NULL ) {
+    struct json_object * item;
+
+    if( !json_object_object_get_ex(
+        intern->object,
+        hbs_str_val(key),
+        &item
+    ) ) {
         return NULL;
     }
     handlebars_value_init_json_object(intern->user.ctx, rv, item);
@@ -156,35 +230,45 @@ static struct handlebars_value * hbs_json_map_find(struct handlebars_value * val
 static struct handlebars_value * hbs_json_array_find(struct handlebars_value * value, size_t index, struct handlebars_value * rv)
 {
     struct handlebars_json * intern = GET_INTERN_V(value);
-    struct json_object * item = json_object_array_get_idx(intern->object, (int) index);
-    if( item == NULL ) {
+    struct json_object * item;
+
+    if( index >= json_object_array_length(intern->object) ) {
         return NULL;
     }
+    item = json_object_array_get_idx(intern->object, index);
     handlebars_value_init_json_object(intern->user.ctx, rv, item);
     return rv;
 }
 
 static bool hbs_json_iterator_next_void(struct handlebars_value_iterator * it)
 {
+    (void) it;
     return false;
+}
+
+static void hbs_json_iterator_close_object(struct handlebars_value_iterator * it)
+{
+    if( it->key != NULL ) {
+        handlebars_string_delref(it->key);
+        it->key = NULL;
+    }
+    handlebars_value_dtor(it->cur);
 }
 
 static bool hbs_json_iterator_next_object(struct handlebars_value_iterator * it)
 {
-    struct handlebars_value * value = it->value;
-    struct handlebars_json * intern = GET_INTERN_V(value);
+    struct handlebars_json * intern = GET_INTERN(it->user);
     struct lh_entry * entry;
     char * tmp;
 
-    assert(value != NULL);
-    assert(handlebars_value_get_real_type(value) == HANDLEBARS_VALUE_TYPE_USER);
+    assert(it->user != NULL);
     assert(it->key != NULL);
 
     handlebars_string_delref(it->key);
+    it->key = NULL;
 
     entry = (struct lh_entry *) it->usr;
     if( !entry || !entry->next ) {
-        handlebars_value_dtor(it->cur);
         return false;
     }
 
@@ -196,17 +280,19 @@ static bool hbs_json_iterator_next_object(struct handlebars_value_iterator * it)
     return true;
 }
 
+static void hbs_json_iterator_close_array(struct handlebars_value_iterator * it)
+{
+    handlebars_value_dtor(it->cur);
+}
+
 static bool hbs_json_iterator_next_array(struct handlebars_value_iterator * it)
 {
-    struct handlebars_value * value = it->value;
-    struct handlebars_json * intern = GET_INTERN_V(value);
+    struct handlebars_json * intern = GET_INTERN(it->user);
 
-    assert(value != NULL);
-    assert(handlebars_value_get_real_type(value) == HANDLEBARS_VALUE_TYPE_USER);
+    assert(it->user != NULL);
 
     it->index++;
     if( it->index >= (size_t) json_object_array_length(intern->object) ) {
-        handlebars_value_dtor(it->cur);
         return false;
     }
 
@@ -233,6 +319,7 @@ static bool hbs_json_iterator_init(struct handlebars_value_iterator * it, struct
             it->key = handlebars_string_ctor(intern->user.ctx, tmp, strlen(tmp));
             handlebars_value_init_json_object(intern->user.ctx, it->cur, (json_object *) entry->v);
             it->next = &hbs_json_iterator_next_object;
+            it->close = &hbs_json_iterator_close_object;
             handlebars_string_addref(it->key);
             return true;
         }
@@ -245,6 +332,7 @@ static bool hbs_json_iterator_init(struct handlebars_value_iterator * it, struct
             it->index = 0;
             handlebars_value_init_json_object(intern->user.ctx, it->cur, json_object_array_get_idx(intern->object, (int) it->index));
             it->next = &hbs_json_iterator_next_array;
+            it->close = &hbs_json_iterator_close_array;
             return true;
 
         default: // LCOV_EXCL_START
@@ -288,7 +376,7 @@ void handlebars_value_init_json_object(struct handlebars_context * ctx, struct h
 
     switch( json_object_get_type(json) ) {
         case json_type_null:
-            // do nothing
+            handlebars_value_null(value);
             break;
         case json_type_boolean:
             handlebars_value_boolean(value, json_object_get_boolean(json));
@@ -308,7 +396,11 @@ void handlebars_value_init_json_object(struct handlebars_context * ctx, struct h
             obj = handlebars_talloc(ctx, struct handlebars_json);
             HANDLEBARS_MEMCHECK(obj, ctx);
             handlebars_user_init((struct handlebars_user *) obj, ctx, &handlebars_value_hbs_json_handlers);
+            // Increment only after the fallible allocation so a failed wrap
+            // cannot leak a JSON reference.
+            json_object_get(json);
             obj->object = json;
+            talloc_set_destructor(obj, handlebars_json_dtor);
             handlebars_value_user(value, (struct handlebars_user *) obj);
             break;
 
@@ -316,19 +408,97 @@ void handlebars_value_init_json_object(struct handlebars_context * ctx, struct h
     }
 }
 
-static struct json_object *json_tokener_parse_verbose_length(const char *str, size_t length, enum json_tokener_error *error)
+static bool hbs_json_is_whitespace(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static bool hbs_json_is_complete_number(const char * str, size_t length)
+{
+    size_t i = 0;
+
+    while( i < length && hbs_json_is_whitespace(str[i]) ) {
+        i++;
+    }
+    if( i < length && str[i] == '-' ) {
+        i++;
+    }
+    if( i >= length ) {
+        return false;
+    }
+    if( str[i] == '0' ) {
+        i++;
+    } else if( str[i] >= '1' && str[i] <= '9' ) {
+        do {
+            i++;
+        } while( i < length && str[i] >= '0' && str[i] <= '9' );
+    } else {
+        return false;
+    }
+    if( i < length && str[i] == '.' ) {
+        i++;
+        if( i >= length || str[i] < '0' || str[i] > '9' ) {
+            return false;
+        }
+        do {
+            i++;
+        } while( i < length && str[i] >= '0' && str[i] <= '9' );
+    }
+    if( i < length && (str[i] == 'e' || str[i] == 'E') ) {
+        i++;
+        if( i < length && (str[i] == '+' || str[i] == '-') ) {
+            i++;
+        }
+        if( i >= length || str[i] < '0' || str[i] > '9' ) {
+            return false;
+        }
+        do {
+            i++;
+        } while( i < length && str[i] >= '0' && str[i] <= '9' );
+    }
+    while( i < length && hbs_json_is_whitespace(str[i]) ) {
+        i++;
+    }
+    return i == length;
+}
+
+HBS_ATTR_NOINLINE
+static struct json_object *json_tokener_parse_verbose_length(
+    struct handlebars_context * context,
+    const char *str,
+    size_t length,
+    enum json_tokener_error *error
+)
 {
 	struct json_tokener *tok;
 	struct json_object *obj;
+    bool finished_at_boundary = false;
 
 	tok = json_tokener_new();
 	if (!tok) {
-		return NULL;
+        handlebars_throw(context, HANDLEBARS_NOMEM, "Failed to initialize JSON parser");
     }
 
-	obj = json_tokener_parse_ex(tok, str, length);
+	obj = json_tokener_parse_ex(tok, str, (int) length);
+	if( tok->err == json_tokener_continue ) {
+        /* A length-delimited scalar has no structural byte that tells json-c
+         * it is complete. Feed a virtual terminator rather than reading past
+         * the caller's buffer. */
+        obj = json_tokener_parse_ex(tok, "", 1);
+        finished_at_boundary = true;
+    }
 	*error = tok->err;
-	if (tok->err != json_tokener_success) {
+	if( finished_at_boundary &&
+        *error == json_tokener_success &&
+        obj != NULL &&
+        (json_object_get_type(obj) == json_type_int ||
+            json_object_get_type(obj) == json_type_double) &&
+        !hbs_json_is_complete_number(str, length) ) {
+        json_object_put(obj);
+        obj = NULL;
+        *error = json_tokener_error_parse_number;
+    }
+	if (*error != json_tokener_success) {
 		if (obj != NULL) {
 			json_object_put(obj);
         }
@@ -339,22 +509,153 @@ static struct json_object *json_tokener_parse_verbose_length(const char *str, si
 	return obj;
 }
 
+static HBS_ATTR_NORETURN void handlebars_json_rethrow(
+    struct handlebars_context * context,
+    jmp_buf * previous
+)
+{
+    if( previous != NULL ) {
+        handlebars_longjmp(context, previous, context->e->num);
+    }
+    abort();
+}
+
 void handlebars_value_init_json_stringl(struct handlebars_context *ctx, struct handlebars_value * value, const char * json, size_t length)
 {
+    struct handlebars_error * error = ctx->e;
+    jmp_buf * volatile previous = error->jmp;
     enum json_tokener_error parse_err = json_tokener_success;
-    struct json_object * result = json_tokener_parse_verbose_length(json, length, &parse_err);
+    struct json_object * result;
+    jmp_buf buf;
+
+    if( unlikely(length > INT_MAX) ) {
+        handlebars_throw(ctx, HANDLEBARS_ERROR, "JSON input length exceeds parser limit");
+    }
+
+    result = json_tokener_parse_verbose_length(ctx, json, length, &parse_err);
     if( parse_err == json_tokener_success ) {
-        struct handlebars_json *obj = handlebars_talloc(ctx, struct handlebars_json);;
-        HANDLEBARS_MEMCHECK(obj, ctx);
-        obj->object = result;
-        talloc_set_destructor(obj, handlebars_json_dtor);
+        if( handlebars_setjmp_ex(ctx, &buf) ) {
+            json_object_put(result);
+            error->jmp = previous;
+            handlebars_json_rethrow(ctx, previous);
+        }
         handlebars_value_init_json_object(ctx, value, result);
+        json_object_put(result);
+        error->jmp = previous;
     } else {
-        handlebars_throw(ctx, HANDLEBARS_ERROR, "JSON Parse error: %s", json_tokener_error_desc(parse_err));
+        enum handlebars_error_type error_type = HANDLEBARS_ERROR;
+
+        // json_tokener_error_memory was added in json-c 0.17.
+#if defined(JSON_C_VERSION_NUM) && JSON_C_VERSION_NUM >= 0x001100
+        if( parse_err == json_tokener_error_memory ) {
+            error_type = HANDLEBARS_NOMEM;
+        }
+#endif
+        handlebars_throw(ctx, error_type, "JSON Parse error: %s", json_tokener_error_desc(parse_err));
     }
 }
 
 void handlebars_value_init_json_string(struct handlebars_context *ctx, struct handlebars_value * value, const char * json)
 {
     handlebars_value_init_json_stringl(ctx, value, json, strlen(json) + 1);
+}
+
+HBS_ATTR_NOINLINE
+static enum handlebars_error_type handlebars_json_try_guarded(
+    struct handlebars_context * context,
+    struct handlebars_json_try_state * state
+)
+{
+    struct handlebars_error * error = context->e;
+    jmp_buf * volatile previous = error->jmp;
+    enum handlebars_error_type volatile caught = HANDLEBARS_SUCCESS;
+    jmp_buf buf;
+
+    if( handlebars_setjmp_ex(context, &buf) ) {
+        caught = error->num;
+    } else {
+        switch( state->operation ) {
+            case handlebars_json_try_object:
+                handlebars_value_init_json_object(
+                    context,
+                    &state->value,
+                    state->object
+                );
+                break;
+            case handlebars_json_try_string:
+                handlebars_value_init_json_stringl(
+                    context,
+                    &state->value,
+                    state->json,
+                    state->length
+                );
+                break;
+            default: abort(); // LCOV_EXCL_LINE
+        }
+    }
+
+    error->jmp = previous;
+    return caught;
+}
+
+static enum handlebars_error_type handlebars_json_try(
+    struct handlebars_context * context,
+    struct handlebars_value * value,
+    struct handlebars_json_try_state * state
+)
+{
+    enum handlebars_error_type error;
+
+    handlebars_value_init(&state->value);
+    handlebars_error_clear(context);
+    error = handlebars_json_try_guarded(context, state);
+    if( error == HANDLEBARS_SUCCESS ) {
+        handlebars_value_value(value, &state->value);
+    }
+    handlebars_value_dtor(&state->value);
+    return error;
+}
+
+enum handlebars_error_type handlebars_value_init_json_object_try(
+    struct handlebars_context * context,
+    struct handlebars_value * value,
+    struct json_object * json
+)
+{
+    struct handlebars_json_try_state state = {
+        .operation = handlebars_json_try_object,
+        .object = json
+    };
+
+    return handlebars_json_try(context, value, &state);
+}
+
+enum handlebars_error_type handlebars_value_init_json_stringl_try(
+    struct handlebars_context * context,
+    struct handlebars_value * value,
+    const char * json,
+    size_t length
+)
+{
+    struct handlebars_json_try_state state = {
+        .operation = handlebars_json_try_string,
+        .json = json,
+        .length = length
+    };
+
+    return handlebars_json_try(context, value, &state);
+}
+
+enum handlebars_error_type handlebars_value_init_json_string_try(
+    struct handlebars_context * context,
+    struct handlebars_value * value,
+    const char * json
+)
+{
+    return handlebars_value_init_json_stringl_try(
+        context,
+        value,
+        json,
+        strlen(json) + 1
+    );
 }

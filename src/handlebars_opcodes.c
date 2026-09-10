@@ -70,6 +70,14 @@ void handlebars_operand_set_longval(struct handlebars_operand * operand, long ar
     operand->data.longval = arg;
 }
 
+void handlebars_operand_set_doubleval(struct handlebars_operand * operand, double arg)
+{
+    assert(operand != NULL);
+
+    operand->type = handlebars_operand_type_double;
+    operand->data.doubleval = arg;
+}
+
 void handlebars_operand_set_stringval(
     struct handlebars_context * context,
     struct handlebars_opcode * opcode,
@@ -274,6 +282,7 @@ enum handlebars_opcode_type handlebars_opcode_reverse_readable_type(const char *
         case 'r':
             _RTYPE_REV_CMP(resolve_possible_lambda, resolvePossibleLambda);
             _RTYPE_REV_CMP(register_decorator, registerDecorator);
+            _RTYPE_REV_CMP(return, return);
             break;
 
         default: assert(0); break; // LCOV_EXCL_LINE
@@ -313,8 +322,6 @@ short handlebars_opcode_num_operands(enum handlebars_opcode_type type)
         case handlebars_opcode_type_push_string_param:
         case handlebars_opcode_type_invoke_known_helper:
         case handlebars_opcode_type_lookup_block_param:
-        // Added in v4
-        case handlebars_opcode_type_register_decorator:
             return 2;
 
 
@@ -328,6 +335,8 @@ short handlebars_opcode_num_operands(enum handlebars_opcode_type type)
         case handlebars_opcode_type_push_id:
         // In v4 lookup_data was changed from 2 to 3 operands
         case handlebars_opcode_type_lookup_data:
+        // Serialization may add an inline-partial prologue marker.
+        case handlebars_opcode_type_register_decorator:
             return 3;
 
         // In v4 lookup_on_context was changed from 3 to 4 operands

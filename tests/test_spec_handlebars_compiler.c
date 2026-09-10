@@ -133,14 +133,9 @@ static int loadTestOpcodeOperand(
             handlebars_operand_set_arrayval(test_context, opcode, operand, (const char **) arr);
             break;
         }
-        case json_type_double: {
-            char tmp[64];
-            snprintf(tmp, 63, "%g", json_object_get_double(object));
-            str = handlebars_string_ctor(test_context, tmp, strlen(tmp));
-            handlebars_operand_set_stringval(test_context, opcode, operand, str);
-            //handlebars_operand_set_stringval(opcode, operand, json_object_get_string(object));
+        case json_type_double:
+            handlebars_operand_set_doubleval(operand, json_object_get_double(object));
             break;
-        }
         default:
             return 1;
             break;
@@ -603,7 +598,7 @@ static int loadSpec(const char * name)
     }
 
     // Parse JSON
-    result = json_tokener_parse(data);
+    result = hbs_test_json_parse_document(data, data_len);
     // @todo: parsing errors seem to cause segfaults....
     if( result == NULL ) {
         fprintf(stderr, "Failed so parse JSON\n");
@@ -720,7 +715,7 @@ static Suite * suite(void)
 
     TCase * tc_handlebars_spec_compiler = tcase_create(title);
     tcase_add_checked_fixture(tc_handlebars_spec_compiler, default_setup, default_teardown);
-    tcase_add_loop_test(tc_handlebars_spec_compiler, handlebars_spec_compiler, 0, tests_len - 1);
+    tcase_add_loop_test(tc_handlebars_spec_compiler, handlebars_spec_compiler, 0, tests_len);
     suite_add_tcase(s, tc_handlebars_spec_compiler);
 
     return s;

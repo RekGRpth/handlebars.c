@@ -181,24 +181,28 @@ FIXTURE_FN(471141295)
     FIXTURE_STRING("dude");
 }
 
-static int value_for_510017722 = 1;
-FIXTURE_FN(510017722)
+static int value_for_4284892664 = 1;
+FIXTURE_FN(4284892664)
 {
-    // "function (options) {\n          if( typeof value === 'undefined' ) { value = 1; } return options.fn({value: 'bar'}, {blockParams: options.fn.blockParams === 1 ? [value++, value++] : undefined});\n        }"
+    // "function (options) {\n          if( typeof value === 'undefined' ) { value = 1; } return options.fn({value: 'bar'}, {blockParams: options.fn.blockParams === 1 ? [global.value++, global.value++] : undefined});\n        }"
     HANDLEBARS_VALUE_DECL(context);
     HANDLEBARS_VALUE_DECL(bp1);
     HANDLEBARS_VALUE_DECL(bp2);
     HANDLEBARS_VALUE_DECL(block_params);
+    struct handlebars_value * effective_block_params = NULL;
 
     handlebars_value_init_json_string(CONTEXT, context, "{\"value\": \"bar\"}");
-    handlebars_value_integer(bp1, value_for_510017722++);
-    handlebars_value_integer(bp2, value_for_510017722++);
+    if( options->program_block_params == 1 ) {
+        handlebars_value_integer(bp1, value_for_4284892664++);
+        handlebars_value_integer(bp2, value_for_4284892664++);
 
-    handlebars_value_array(block_params, handlebars_stack_ctor(CONTEXT, 2));
-    handlebars_value_array_push(block_params, bp1); // @TODO ignoring return value - should probably make a handlebars_value_push()
-    handlebars_value_array_push(block_params, bp2); // @TODO ignoring return value - should probably make a handlebars_value_push()
+        handlebars_value_array(block_params, handlebars_stack_ctor(CONTEXT, 2));
+        handlebars_value_array_push(block_params, bp1); // @TODO ignoring return value - should probably make a handlebars_value_push()
+        handlebars_value_array_push(block_params, bp2); // @TODO ignoring return value - should probably make a handlebars_value_push()
+        effective_block_params = block_params;
+    }
 
-    struct handlebars_string * tmp = handlebars_vm_execute_program_ex(vm, options->program, context, NULL, block_params);
+    struct handlebars_string * tmp = handlebars_vm_execute_program_ex(vm, options->program, context, NULL, effective_block_params);
     handlebars_value_str(rv, tmp);
 
     HANDLEBARS_VALUE_UNDECL(block_params);
@@ -234,13 +238,14 @@ FIXTURE_FN(620640779)
     // "function (times, times2) {\n      if (typeof times !== 'number') { times = 'NaN'; }\n      if (typeof times2 !== 'number') { times2 = 'NaN'; }\n      return 'Hello ' + times + ' ' + times2 + ' times';\n    }"
     struct handlebars_value * times = HANDLEBARS_ARG_AT(0);
     struct handlebars_value * times2 = HANDLEBARS_ARG_AT(1);
-    // @todo this should be a float perhaps?
-    /* if( times->type != HANDLEBARS_VALUE_TYPE_FLOAT || times->type != HANDLEBARS_VALUE_TYPE_INTEGER ) {
+    if( handlebars_value_get_type(times) != HANDLEBARS_VALUE_TYPE_FLOAT &&
+            handlebars_value_get_type(times) != HANDLEBARS_VALUE_TYPE_INTEGER ) {
         handlebars_value_cstrl(times, HBS_STRL("NaN"));
     }
-    if( times2->type != HANDLEBARS_VALUE_TYPE_FLOAT || times2->type != HANDLEBARS_VALUE_TYPE_INTEGER ) {
+    if( handlebars_value_get_type(times2) != HANDLEBARS_VALUE_TYPE_FLOAT &&
+            handlebars_value_get_type(times2) != HANDLEBARS_VALUE_TYPE_INTEGER ) {
         handlebars_value_cstrl(times2, HBS_STRL("NaN"));
-    } */
+    }
     char * tmp = handlebars_talloc_asprintf(
             vm,
             "Hello %s %s times",
@@ -596,7 +601,7 @@ FIXTURE_FN(1582700088)
 FIXTURE_FN(1623791204)
 {
     struct handlebars_value * noun = map_str_find(options->hash, HBS_STRL("noun"));
-    char * tmp = hbs_str_val(VALUE_TO_STRING(noun));
+    const char * tmp = hbs_str_val(VALUE_TO_STRING(noun));
     char * res = handlebars_talloc_asprintf(
             vm,
             "Hello %s",
@@ -1324,10 +1329,10 @@ FIXTURE_FN(3781305181)
 {
     // "function (times) {\n      if (typeof times !== 'number') { times = 'NaN'; }\n      return 'Hello ' + times + ' times';\n    }"
     struct handlebars_value * times = HANDLEBARS_ARG_AT(0);
-    // @todo this should be a float perhaps?
-    /* if( times->type != HANDLEBARS_VALUE_TYPE_FLOAT || times->type != HANDLEBARS_VALUE_TYPE_INTEGER ) {
+    if( handlebars_value_get_type(times) != HANDLEBARS_VALUE_TYPE_FLOAT &&
+            handlebars_value_get_type(times) != HANDLEBARS_VALUE_TYPE_INTEGER ) {
         handlebars_value_cstrl(times, HBS_STRL("NaN"));
-    }*/
+    }
     char * tmp = handlebars_talloc_asprintf(
             vm,
             "Hello %s times",
@@ -1415,7 +1420,7 @@ FIXTURE_FN(4112130635)
 FIXTURE_FN(4158918668)
 {
     struct handlebars_value * noun = HANDLEBARS_ARG_AT(0);
-    char * tmp = hbs_str_val(VALUE_TO_STRING(noun));
+    const char * tmp = hbs_str_val(VALUE_TO_STRING(noun));
     char * res = handlebars_talloc_asprintf(
             vm,
             "Hello %s",
@@ -1695,7 +1700,8 @@ static void convert_value_to_fixture(struct handlebars_value * value)
         FIXTURE_CASE(461441956);
         FIXTURE_CASE(464915369);
         FIXTURE_CASE(471141295);
-        FIXTURE_CASE(510017722);
+        FIXTURE_CASE_ALIAS(510017722, 4284892664);
+        FIXTURE_CASE(4284892664);
         FIXTURE_CASE(585442881);
         FIXTURE_CASE(620640779);
         FIXTURE_CASE(620828131);

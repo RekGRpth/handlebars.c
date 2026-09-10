@@ -21,12 +21,17 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <talloc.h>
 
 #include <assert.h>
 #include <getopt.h>
+#include <signal.h>
 
 #ifdef HANDLEBARS_HAVE_VALGRIND
 #include <valgrind/valgrind.h>
@@ -57,6 +62,8 @@
 #include "handlebars_vm.h"
 #include "handlebars_yaml.h"
 
+#include "handlebarsc_helpers.h"
+
 #ifdef _MSC_VER
 #define BOOLEAN HBS_BOOLEAN
 #endif
@@ -79,6 +86,8 @@ static bool convert_input = true;
 static bool newline_at_eof = true;
 static size_t pool_size = 2 * 1024 * 1024;
 static bool pretty_print = true;
+static bool output_write_failed = false;
+static struct handlebarsc_helper_registry helper_registry;
 
 enum handlebarsc_mode {
     handlebarsc_mode_usage = 0,
@@ -108,6 +117,11 @@ enum handlebarsc_flag {
     handlebarsc_flag_partial_loader = 505,
     handlebarsc_flag_flags = 506,
     handlebarsc_flag_pretty_print = 507,
+    handlebarsc_flag_helper_exec = 508,
+    handlebarsc_flag_helper_json = 509,
+    handlebarsc_flag_helper_timeout_ms = 510,
+    handlebarsc_flag_helper_output_limit = 511,
+    handlebarsc_flag_allow_helper_override = 512,
 
     // modes
     handlebarsc_flag_lex = 600,
@@ -122,6 +136,89 @@ static enum handlebarsc_mode mode = handlebarsc_mode_execute;
 
 #define HBSC_OPT(a, b, c) {HBS_S1(a), b, 0, c},
 #define HBSC_OPT_END {0, 0, 0, 0}
+
+struct handlebarsc_named_compiler_flag {
+    const char * name;
+    unsigned long value;
+};
+
+static bool parse_unsigned_decimal(
+    const char * input,
+    unsigned long long maximum,
+    unsigned long long * result
+)
+{
+    const char * cursor;
+    char * end = NULL;
+    unsigned long long value;
+
+    if( input[0] == '\0' ) {
+        return false;
+    }
+    for( cursor = input; *cursor != '\0'; cursor++ ) {
+        if( *cursor < '0' || *cursor > '9' ) {
+            return false;
+        }
+    }
+
+    errno = 0;
+    value = strtoull(input, &end, 10);
+    if( errno == ERANGE || end == input || *end != '\0' || value > maximum ) {
+        return false;
+    }
+
+    *result = value;
+    return true;
+}
+
+static bool parse_compiler_flags(const char * input)
+{
+    static const struct handlebarsc_named_compiler_flag named_flags[] = {
+        { "compat", handlebars_compiler_flag_compat },
+        { "known_helpers_only", handlebars_compiler_flag_known_helpers_only },
+        { "string_params", handlebars_compiler_flag_string_params },
+        { "track_ids", handlebars_compiler_flag_track_ids },
+        { "no_escape", handlebars_compiler_flag_no_escape },
+        { "ignore_standalone", handlebars_compiler_flag_ignore_standalone },
+        { "alternate_decorators", handlebars_compiler_flag_alternate_decorators },
+        { "strict", handlebars_compiler_flag_strict },
+        { "assume_objects", handlebars_compiler_flag_assume_objects },
+        { "mustache_style_lambdas", handlebars_compiler_flag_mustache_style_lambdas }
+    };
+    const char * cursor = input;
+    unsigned long parsed_flags = 0;
+
+    for(;;) {
+        const char * separator = strchr(cursor, ',');
+        size_t length = separator ? (size_t) (separator - cursor) : strlen(cursor);
+        size_t index;
+
+        if( length == 0 ) {
+            fprintf(stderr, "Compiler flag names must not be empty\n");
+            return false;
+        }
+
+        for( index = 0; index < sizeof(named_flags) / sizeof(named_flags[0]); index++ ) {
+            if( strlen(named_flags[index].name) == length
+                    && memcmp(named_flags[index].name, cursor, length) == 0 ) {
+                parsed_flags |= named_flags[index].value;
+                break;
+            }
+        }
+        if( index == sizeof(named_flags) / sizeof(named_flags[0]) ) {
+            fprintf(stderr, "Unknown compiler flag: ");
+            fwrite(cursor, sizeof(char), length, stderr);
+            fwrite("\n", sizeof(char), 1, stderr);
+            return false;
+        }
+
+        if( separator == NULL ) {
+            compiler_flags |= parsed_flags;
+            return true;
+        }
+        cursor = separator + 1;
+    }
+}
 
 /**
  * http://linux.die.net/man/3/getopt_long
@@ -158,6 +255,11 @@ static void readOpts(int argc, char * argv[])
         HBSC_OPT(no-newline, no_argument, handlebarsc_flag_no_newline)
         HBSC_OPT(pool-size, required_argument, handlebarsc_flag_pool_size)
         HBSC_OPT(pretty-print, no_argument, handlebarsc_flag_pretty_print)
+        HBSC_OPT(helper-exec, required_argument, handlebarsc_flag_helper_exec)
+        HBSC_OPT(helper-json, required_argument, handlebarsc_flag_helper_json)
+        HBSC_OPT(helper-timeout-ms, required_argument, handlebarsc_flag_helper_timeout_ms)
+        HBSC_OPT(helper-output-limit, required_argument, handlebarsc_flag_helper_output_limit)
+        HBSC_OPT(allow-helper-override, no_argument, handlebarsc_flag_allow_helper_override)
         // end
         HBSC_OPT_END
     };
@@ -204,36 +306,8 @@ start:
 
         // compiler flags
         case handlebarsc_flag_flags:
-            // we could do this more efficiently
-            if (NULL != strstr(optarg, "compat")) {
-                compiler_flags |= handlebars_compiler_flag_compat;
-            }
-            if (NULL != strstr(optarg, "known_helpers_only")) {
-                compiler_flags |= handlebars_compiler_flag_known_helpers_only;
-            }
-            if (NULL != strstr(optarg, "string_params")) {
-                compiler_flags |= handlebars_compiler_flag_string_params;
-            }
-            if (NULL != strstr(optarg, "track_ids")) {
-                compiler_flags |= handlebars_compiler_flag_track_ids;
-            }
-            if (NULL != strstr(optarg, "no_escape")) {
-                compiler_flags |= handlebars_compiler_flag_no_escape;
-            }
-            if (NULL != strstr(optarg, "ignore_standalone")) {
-                compiler_flags |= handlebars_compiler_flag_ignore_standalone;
-            }
-            if (NULL != strstr(optarg, "alternate_decorators")) {
-                compiler_flags |= handlebars_compiler_flag_alternate_decorators;
-            }
-            if (NULL != strstr(optarg, "strict")) {
-                compiler_flags |= handlebars_compiler_flag_strict;
-            }
-            if (NULL != strstr(optarg, "assume_objects")) {
-                compiler_flags |= handlebars_compiler_flag_assume_objects;
-            }
-            if (NULL != strstr(optarg, "mustache_style_lambdas")) {
-                compiler_flags |= handlebars_compiler_flag_mustache_style_lambdas;
+            if( !parse_compiler_flags(optarg) ) {
+                exit(1);
             }
             break;
 
@@ -259,9 +333,16 @@ start:
             break;
 
         // misc
-        case handlebarsc_flag_run_count:
-            sscanf(optarg, "%ld", &run_count);
+        case handlebarsc_flag_run_count: {
+            unsigned long long value;
+            if( !parse_unsigned_decimal(optarg, (unsigned long long) LONG_MAX, &value)
+                    || value == 0 ) {
+                fprintf(stderr, "Run count must be a positive integer\n");
+                exit(1);
+            }
+            run_count = (long) value;
             break;
+        }
 
         case handlebarsc_flag_no_convert_input:
             convert_input = false;
@@ -271,15 +352,83 @@ start:
             newline_at_eof = false;
             break;
 
-        case handlebarsc_flag_pool_size:
-            sscanf(optarg, "%zu", &pool_size);
+        case handlebarsc_flag_pool_size: {
+            unsigned long long value;
+            if( !parse_unsigned_decimal(optarg, (unsigned long long) SIZE_MAX, &value) ) {
+                fprintf(stderr, "Pool size must be a non-negative integer\n");
+                exit(1);
+            }
+            pool_size = (size_t) value;
             break;
+        }
 
         case handlebarsc_flag_pretty_print:
             pretty_print = true;
             break;
 
-        default: assert(0); break; // LCOV_EXCL_LINE
+        case handlebarsc_flag_helper_exec: {
+            const char * error = NULL;
+            if( !handlebarsc_helper_registry_add(
+                    &helper_registry,
+                    handlebarsc_helper_mode_exec,
+                    optarg,
+                    &error
+            ) ) {
+                fprintf(stderr, "%s\n", error);
+                exit(1);
+            }
+            break;
+        }
+
+        case handlebarsc_flag_helper_json: {
+            const char * error = NULL;
+            if( !handlebarsc_helper_registry_add(
+                    &helper_registry,
+                    handlebarsc_helper_mode_json,
+                    optarg,
+                    &error
+            ) ) {
+                fprintf(stderr, "%s\n", error);
+                exit(1);
+            }
+            break;
+        }
+
+        case handlebarsc_flag_helper_timeout_ms:
+        case handlebarsc_flag_helper_output_limit: {
+            unsigned long long value;
+            unsigned long long maximum = (unsigned long long) LONG_MAX;
+
+            if( c == handlebarsc_flag_helper_output_limit
+                    && (unsigned long long) SIZE_MAX < maximum ) {
+                maximum = (unsigned long long) SIZE_MAX;
+            }
+            if( !parse_unsigned_decimal(optarg, maximum, &value) ) {
+                fprintf(stderr, "External helper limit must be a non-negative integer\n");
+                exit(1);
+            }
+            if( c == handlebarsc_flag_helper_timeout_ms ) {
+                helper_registry.timeout_ms = (unsigned long) value;
+            } else {
+                helper_registry.output_limit = (size_t) value;
+            }
+            helper_registry.options_used = true;
+            break;
+        }
+
+        case handlebarsc_flag_allow_helper_override:
+            helper_registry.allow_override = true;
+            helper_registry.options_used = true;
+            break;
+
+        case '?':
+            exit(1);
+
+        // LCOV_EXCL_START
+        default:
+            fprintf(stderr, "Internal error while parsing command-line options\n");
+            exit(1);
+        // LCOV_EXCL_STOP
     }
 
     goto start;
@@ -358,15 +507,110 @@ static char * file_get_contents(char * filename)
     return buf;
 }
 
+static bool filename_has_suffix(const char * filename, const char * suffix)
+{
+    size_t filename_length = strlen(filename);
+    size_t suffix_length = strlen(suffix);
+
+    return filename_length >= suffix_length
+        && strcmp(filename + filename_length - suffix_length, suffix) == 0;
+}
+
+#ifdef SIGPIPE
+typedef void (*handlebarsc_signal_handler)(int);
+
+static bool ignore_output_sigpipe(handlebarsc_signal_handler * previous_handler)
+{
+    *previous_handler = signal(SIGPIPE, SIG_IGN);
+    if( *previous_handler == SIG_ERR ) {
+        output_write_failed = true;
+        return false;
+    }
+    return true;
+}
+
+static void restore_output_sigpipe(handlebarsc_signal_handler previous_handler)
+{
+    if( signal(SIGPIPE, previous_handler) == SIG_ERR ) {
+        output_write_failed = true;
+    }
+}
+#endif
+
+static void print_output(const char * format, ...) HBS_ATTR_PRINTF(1, 2);
+
+static void print_output(const char * format, ...)
+{
+    va_list args;
+
+#ifdef SIGPIPE
+    handlebarsc_signal_handler previous_handler;
+    if( !ignore_output_sigpipe(&previous_handler) ) {
+        return;
+    }
+#endif
+    va_start(args, format);
+    if( vfprintf(stdout, format, args) < 0 ) {
+        output_write_failed = true;
+    }
+    va_end(args);
+#ifdef SIGPIPE
+    restore_output_sigpipe(previous_handler);
+#endif
+}
+
+static void write_output(const void * buffer, size_t length)
+{
+    if( length == 0 ) {
+        return;
+    }
+#ifdef SIGPIPE
+    handlebarsc_signal_handler previous_handler;
+    if( !ignore_output_sigpipe(&previous_handler) ) {
+        return;
+    }
+#endif
+    if( fwrite(buffer, sizeof(char), length, stdout) != length ) {
+        output_write_failed = true;
+    }
+#ifdef SIGPIPE
+    restore_output_sigpipe(previous_handler);
+#endif
+}
+
+static void flush_output(void)
+{
+#ifdef SIGPIPE
+    handlebarsc_signal_handler previous_handler;
+    if( !ignore_output_sigpipe(&previous_handler) ) {
+        return;
+    }
+#endif
+    if( fflush(stdout) == EOF ) {
+        output_write_failed = true;
+    }
+#ifdef SIGPIPE
+    restore_output_sigpipe(previous_handler);
+#endif
+}
+
 static void readInput(void)
 {
     input_buf = file_get_contents(input_name);
     input_buf_length = talloc_array_length(input_buf) - 1;
 }
 
+static void print_error(struct handlebars_context * ctx)
+{
+    char * message = handlebars_error_message(ctx);
+    const char * fallback = handlebars_error_msg(ctx);
+
+    fprintf(stderr, "ERROR: %s\n", message ? message : (fallback ? fallback : "Unknown error"));
+}
+
 static int do_usage(void)
 {
-    fprintf(stdout,
+    print_output(
         "Usage: handlebarsc [OPTIONS]\n"
         "Example: handlebarsc -t foo.hbs -D bar.json\n"
         "\n"
@@ -393,8 +637,18 @@ static int do_usage(void)
         "  --partial-loader      Specify to enable loading partials dynamically\n"
         "  --partial-path=DIR    The directory in which to look for partials\n"
         "  --partial-ext=EXT     The file extension of partials, including the '.'\n"
-        "  --pool-size=SIZE      The size of the memory pool to use, 0 to disable (default 2 MB)\n"
-        "  --run-count=NUM       The number of times to execute (for benchmarking)\n"
+        "  --pool-size=SIZE      Non-negative memory pool size in bytes; 0 disables it (default 2 MB)\n"
+        "  --run-count=NUM       Positive number of executions (for benchmarking)\n"
+        "  --helper-exec=NAME=COMMAND\n"
+        "                        Register a helper backed by plain executable output\n"
+        "  --helper-json=NAME=COMMAND\n"
+        "                        Register a helper using the structured JSON protocol\n"
+        "  --helper-timeout-ms=MS\n"
+        "                        Per-call timeout; 0 disables it (default 5000)\n"
+        "  --helper-output-limit=BYTES\n"
+        "                        Maximum stdout size; 0 disables it (default 1048576)\n"
+        "  --allow-helper-override\n"
+        "                        Allow later registrations to replace helpers\n"
         "\n"
         "The partial loader will concat the partial-path, given partial name in the template,\n"
         "and the partial-extension to resolve the file from which to load the partial.\n"
@@ -410,8 +664,7 @@ static int do_usage(void)
 
 static int do_version(void)
 {
-    fprintf(
-        stdout,
+    print_output(
         "handlebarsc v%s\n"
         "Copyright (c) anno Domini nostri Jesu Christi MMXVI-MMXXIV John Boehr & contributors\n"
         "License AGPLv3.0+: Affero GNU GPL version 3.0 or later <https://www.gnu.org/licenses/agpl-3.0.html>.\n"
@@ -480,7 +733,7 @@ static int do_lex(void)
 
     // Save jump buffer
     if( handlebars_setjmp_ex(ctx, &jmp) ) {
-        fprintf(stderr, "ERROR: %s\n", handlebars_error_message(ctx));
+        print_error(ctx);
         handlebars_context_dtor(ctx);
         return 1;
     }
@@ -501,8 +754,8 @@ static int do_lex(void)
 
     for ( ; *tokens; tokens++ ) {
         struct handlebars_string * tmp = handlebars_token_print(ctx, *tokens, 1);
-        fwrite(hbs_str_val(tmp), sizeof(char), hbs_str_len(tmp), stdout);
-        fflush(stdout);
+        write_output(hbs_str_val(tmp), hbs_str_len(tmp));
+        flush_output();
         handlebars_talloc_free(tmp);
     }
 
@@ -523,7 +776,7 @@ static int do_parse(void)
 
     // Save jump buffer
     if( handlebars_setjmp_ex(ctx, &jmp) ) {
-        fprintf(stderr, "ERROR: %s\n", handlebars_error_message(ctx));
+        print_error(ctx);
         handlebars_context_dtor(ctx);
         return 1;
     }
@@ -543,7 +796,7 @@ static int do_parse(void)
     ast = handlebars_parse_ex(parser, tmpl, compiler_flags);
 
     output = handlebars_ast_print(HBSCTX(parser), ast);
-    fwrite(hbs_str_val(output), sizeof(char), hbs_str_len(output), stdout);
+    write_output(hbs_str_val(output), hbs_str_len(output));
 
     handlebars_context_dtor(ctx);
     return 0;
@@ -564,7 +817,7 @@ static int do_compile(void)
 
     // Save jump buffer
     if( handlebars_setjmp_ex(ctx, &jmp) ) {
-        fprintf(stderr, "ERROR: %s\n", handlebars_error_message(ctx));
+        print_error(ctx);
         handlebars_context_dtor(ctx);
         return 1;
     }
@@ -573,6 +826,7 @@ static int do_compile(void)
     compiler = handlebars_compiler_ctor(ctx);
 
     handlebars_compiler_set_flags(compiler, compiler_flags);
+    handlebarsc_helper_registry_apply_compiler(&helper_registry, ctx, compiler);
 
     // Read
     readInput();
@@ -591,7 +845,7 @@ static int do_compile(void)
 
     // Print
     output = handlebars_program_print(ctx, program, 0);
-    fwrite(hbs_str_val(output), sizeof(char), hbs_str_len(output), stdout);
+    write_output(hbs_str_val(output), hbs_str_len(output));
 
     handlebars_context_dtor(ctx);
     return 0;
@@ -613,7 +867,7 @@ static int do_module(void)
 
     // Save jump buffer
     if( handlebars_setjmp_ex(ctx, &jmp) ) {
-        fprintf(stderr, "ERROR: %s\n", handlebars_error_message(ctx));
+        print_error(ctx);
         handlebars_context_dtor(ctx);
         return 1;
     }
@@ -622,6 +876,7 @@ static int do_module(void)
     compiler = handlebars_compiler_ctor(ctx);
 
     handlebars_compiler_set_flags(compiler, compiler_flags);
+    handlebarsc_helper_registry_apply_compiler(&helper_registry, ctx, compiler);
 
     // Read
     readInput();
@@ -645,10 +900,10 @@ static int do_module(void)
     // Print
     if (pretty_print) {
         output = handlebars_module_print(ctx, module);
-        fwrite(hbs_str_val(output), sizeof(char), hbs_str_len(output), stdout);
+        write_output(hbs_str_val(output), hbs_str_len(output));
     } else {
         handlebars_module_normalize_pointers(module, (void *) 0);
-        fwrite((char *) module, sizeof(char), handlebars_module_get_size(module), stdout);
+        write_output(module, handlebars_module_get_size(module));
     }
 
     handlebars_context_dtor(ctx);
@@ -670,7 +925,7 @@ static int do_execute(void)
 
     // Save jump buffer
     if( handlebars_setjmp_ex(ctx, &jmp) ) {
-        fprintf(stderr, "ERROR: %s\n", handlebars_error_message(ctx));
+        print_error(ctx);
         handlebars_context_dtor(ctx);
         return 1;
     }
@@ -687,6 +942,7 @@ static int do_execute(void)
     }
 
     handlebars_compiler_set_flags(compiler, compiler_flags);
+    handlebarsc_helper_registry_apply_compiler(&helper_registry, ctx, compiler);
 
     // Read
     readInput();
@@ -705,22 +961,20 @@ static int do_execute(void)
     // Read context
     HANDLEBARS_VALUE_DECL(input);
     if( input_data_name ) {
-        size_t input_data_name_len = strlen(input_data_name);
+        bool input_is_yaml = filename_has_suffix(input_data_name, ".yaml")
+            || filename_has_suffix(input_data_name, ".yml");
         char * input_str = file_get_contents(input_data_name);
         size_t input_str_size = talloc_array_length(input_str);
         if (input_str && input_str_size > 1) {
-            if (handlebars_value_is_empty(input) && input_data_name_len > 5 && (0 == strcmp(input_data_name + input_data_name_len - 5, ".yaml") ||
-                    0 == strcmp(input_data_name + input_data_name_len - 4, ".yml"))) {
+            if( input_is_yaml ) {
 #ifdef HANDLEBARS_HAVE_YAML
                 handlebars_value_init_yaml_string(ctx, input, input_str);
 #else
                 fprintf(stderr, "Failed to process input data: YAML support is disabled");
                 exit(1);
 #endif
-            }
-            if (handlebars_value_is_empty(input)) {
+            } else {
 #ifdef HANDLEBARS_HAVE_JSON
-                // assume json
                 handlebars_value_init_json_stringl(ctx, input, input_str, input_str_size - 1);
                 if (convert_input) {
                     handlebars_value_convert(input);
@@ -754,19 +1008,33 @@ static int do_execute(void)
         vm = handlebars_vm_ctor(ctx);
         handlebars_vm_set_flags(vm, compiler_flags);
         handlebars_vm_set_partials(vm, partials);
+        handlebarsc_helper_registry_apply_vm(&helper_registry, vm);
 
-        buffer = handlebars_vm_execute(vm, module, input);
+        enum handlebars_error_type execute_error = handlebars_vm_execute_try(
+            vm,
+            module,
+            input,
+            &buffer
+        );
+        if( execute_error != HANDLEBARS_SUCCESS ) {
+            print_error(ctx);
+            handlebars_vm_dtor(vm);
+            HANDLEBARS_VALUE_UNDECL(input);
+            HANDLEBARS_VALUE_UNDECL(partials);
+            handlebars_context_dtor(ctx);
+            return 1;
+        }
         buffer = talloc_steal(ctx, buffer);
 
         handlebars_vm_dtor(vm);
     } while(--run_count > 0);
 
     if (buffer) {
-        fwrite(hbs_str_val(buffer), sizeof(char), hbs_str_len(buffer), stdout);
+        write_output(hbs_str_val(buffer), hbs_str_len(buffer));
     }
 
     if (newline_at_eof) {
-        fwrite("\n", sizeof(char), 1, stdout);
+        write_output("\n", 1);
     }
 
     HANDLEBARS_VALUE_UNDECL(input);
@@ -775,8 +1043,18 @@ static int do_execute(void)
     return 0;
 }
 
+static void cleanup_root(void)
+{
+    if( root != NULL ) {
+        talloc_free(root);
+        root = NULL;
+    }
+}
+
 int main(int argc, char * argv[])
 {
+    int rc;
+
 #ifdef HANDLEBARS_HAVE_VALGRIND
     if (RUNNING_ON_VALGRIND) {
         pool_size = 0;
@@ -784,13 +1062,33 @@ int main(int argc, char * argv[])
 #endif
 
     root = talloc_new(NULL);
+    atexit(cleanup_root);
+    handlebarsc_helper_registry_init(&helper_registry, root);
 
     if( argc <= 1 ) {
         do_usage();
-        return 1;
+        rc = 1;
+        goto done;
     }
 
     readOpts(argc, argv);
+
+    {
+        const char * error = NULL;
+        bool supported_mode = mode == handlebarsc_mode_compile
+            || mode == handlebarsc_mode_module
+            || mode == handlebarsc_mode_execute;
+
+        if( !handlebarsc_helper_registry_validate(
+                &helper_registry,
+                supported_mode,
+                &error
+        ) ) {
+            fprintf(stderr, "%s\n", error);
+            rc = 1;
+            goto done;
+        }
+    }
 
     if (pool_size > 0) {
         void * old_root = root;
@@ -806,20 +1104,30 @@ int main(int argc, char * argv[])
     }
 
     switch( mode ) {
-        case handlebarsc_mode_version: return do_version();
-        case handlebarsc_mode_lex: return do_lex();
-        case handlebarsc_mode_parse: return do_parse();
-        case handlebarsc_mode_compile: return do_compile();
-        case handlebarsc_mode_module: return do_module();
-        case handlebarsc_mode_execute: return do_execute();
-        case handlebarsc_mode_debuginfo: return do_debuginfo();
-        case handlebarsc_mode_usage: return do_usage();
+        case handlebarsc_mode_version: rc = do_version(); break;
+        case handlebarsc_mode_lex: rc = do_lex(); break;
+        case handlebarsc_mode_parse: rc = do_parse(); break;
+        case handlebarsc_mode_compile: rc = do_compile(); break;
+        case handlebarsc_mode_module: rc = do_module(); break;
+        case handlebarsc_mode_execute: rc = do_execute(); break;
+        case handlebarsc_mode_debuginfo: rc = do_debuginfo(); break;
+        case handlebarsc_mode_usage: rc = do_usage(); break;
 
         // LCOV_EXCL_START
         default:
             assert(0);
             do_usage();
-            return 1;
+            rc = 1;
+            break;
         // LCOV_EXCL_STOP
     }
+
+done:
+    flush_output();
+    if( output_write_failed || ferror(stdout) ) {
+        fprintf(stderr, "Failed to write output\n");
+        rc = 1;
+    }
+    cleanup_root();
+    return rc;
 }

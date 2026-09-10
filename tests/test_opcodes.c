@@ -77,6 +77,7 @@ START_TEST(test_opcode_readable_type)
 			const char * expected = _RTYPE_STR(name); \
 			const char * actual = handlebars_opcode_readable_type(_RTYPE_MK(type)); \
 			ck_assert_str_eq(expected, actual); \
+			ck_assert_int_eq(_RTYPE_MK(type), handlebars_opcode_reverse_readable_type(expected)); \
 		} while(0)
 
     _RTYPE_TEST(nil, nil);
@@ -112,6 +113,9 @@ START_TEST(test_opcode_readable_type)
     _RTYPE_TEST(lookup_on_context, lookupOnContext);
 
     _RTYPE_TEST(lookup_data, lookupData);
+    _RTYPE_TEST(lookup_block_param, lookupBlockParam);
+    _RTYPE_TEST(register_decorator, registerDecorator);
+    _RTYPE_TEST(return, return);
 
     _RTYPE_TEST(invalid, invalid);
 
@@ -152,6 +156,27 @@ START_TEST(test_operand_set_longval)
     handlebars_operand_set_longval(&op, -65);
     ck_assert_int_eq(handlebars_operand_type_long, op.type);
     ck_assert_int_eq(-65, op.data.longval);
+}
+END_TEST
+
+START_TEST(test_operand_set_doubleval)
+{
+    struct handlebars_operand op;
+
+    handlebars_operand_set_doubleval(&op, -12.5);
+    ck_assert_int_eq(handlebars_operand_type_double, op.type);
+    ck_assert_double_eq(-12.5, op.data.doubleval);
+}
+END_TEST
+
+START_TEST(test_operand_type_numeric_values_stable)
+{
+    ck_assert_int_eq(handlebars_operand_type_null, 0);
+    ck_assert_int_eq(handlebars_operand_type_boolean, 1);
+    ck_assert_int_eq(handlebars_operand_type_long, 2);
+    ck_assert_int_eq(handlebars_operand_type_string, 3);
+    ck_assert_int_eq(handlebars_operand_type_array, 4);
+    ck_assert_int_eq(handlebars_operand_type_double, 5);
 }
 END_TEST
 
@@ -311,12 +336,14 @@ static Suite * suite(void)
     Suite * s = suite_create("Opcodes");
 
 	REGISTER_TEST_FIXTURE(s, test_opcode_ctor, "Constructor");
-	REGISTER_TEST_FIXTURE(s, test_opcode_ctor_failed_alloc, "Constructor (failed alloc)");
+	REGISTER_MEMORY_TEST_FIXTURE(s, test_opcode_ctor_failed_alloc, "Constructor (failed alloc)");
 	REGISTER_TEST_FIXTURE(s, test_opcode_readable_type, "Readable Type");
 
 	REGISTER_TEST_FIXTURE(s, test_operand_set_null, "Set operand null");
 	REGISTER_TEST_FIXTURE(s, test_operand_set_boolval, "Set operand boolval");
 	REGISTER_TEST_FIXTURE(s, test_operand_set_longval, "Set operand longval");
+	REGISTER_TEST_FIXTURE(s, test_operand_set_doubleval, "Set operand doubleval");
+	REGISTER_TEST_FIXTURE(s, test_operand_type_numeric_values_stable, "Operand type numeric values remain stable");
 	REGISTER_TEST_FIXTURE(s, test_operand_set_stringval, "Set operand stringval");
 	//REGISTER_TEST_FIXTURE(s, test_operand_set_stringval_failed_alloc, "Set operand stringval (failed alloc)");
     REGISTER_TEST_FIXTURE(s, test_operand_set_arrayval, "Set operand arrayval");

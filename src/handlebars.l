@@ -75,22 +75,36 @@
 #define handlebars_yy_unput_n(n) \
 	do { \
 		int i; \
+		int yyunput_count = (n); \
  		char * yycopy = MC(handlebars_talloc_strndup(yyextra, yytext, yyleng)); \
-		for ( i = yyleng - 1; i >= yyleng - n && i >= 0; --i ) { \
+		for ( i = yyleng - 1; i >= yyleng - yyunput_count && i >= 0; --i ) { \
 			unput( yycopy[i] ); \
 		} \
+		yycolumn -= yyunput_count; \
 		handlebars_talloc_free(yycopy); \
     } while(0)
 
 #define handlebars_yy_copy_lval() \
     yylval->string = handlebars_string_ctor(HBSCTX(yyextra), yytext, yyleng);
 
+static int handlebars_yy_next_column(const char * text, int length, int column)
+{
+    int i;
+
+    for( i = length - 1; i >= 0; i-- ) {
+        if( text[i] == '\n' ) {
+            return length - i - 1;
+        }
+    }
+    return column + length;
+}
+
 #define YY_USER_ACTION \
     yylloc->first_line = yylloc->last_line = yylineno; \
     yylloc->first_column = yycolumn; \
     yylloc->last_column = yycolumn + yyleng - 1; \
-    yycolumn += yyleng; \
-   	YY_USER_DEBUG_ACTION;
+    yycolumn = handlebars_yy_next_column(yytext, yyleng, yycolumn); \
+    YY_USER_DEBUG_ACTION;
 %}
 
 %option prefix="handlebars_yy_"
@@ -128,6 +142,7 @@ EEMU \\\\\{\{\{?
 CONTENT [^\x00\{\\\r\n]*[\r\n]*
 
 WHITESPACE [ \r\n\t]
+WORD_CHAR [A-Za-z0-9_]
 
 IDC	  [^ \r\n\t!\"#%-,\.\/;->@\[-\^`\{-~]
 ID    {IDC}+/{LOOKAHEAD}
@@ -285,7 +300,7 @@ BLOCKPARAM [\x7C]
 										return OPEN_ENDBLOCK;
                              		}
 
-<mu>"{{"{LEFT_STRIP}?"^"\s*{RIGHT_STRIP}?"}}"        {
+<mu>"{{"{LEFT_STRIP}?"^"{WHITESPACE}*{RIGHT_STRIP}?"}}"        {
 										// v2.0.0 handlebars.l line 73
 										yy_pop_state(yyg);
 										handlebars_yy_copy_lval();
@@ -305,7 +320,18 @@ BLOCKPARAM [\x7C]
 										return OPEN_INVERSE;
                              		}
 
-<mu>"{{"{LEFT_STRIP}?\s*"else"   	{
+<mu>"{{"{LEFT_STRIP}?{WHITESPACE}*"else"/{WORD_CHAR}     {
+										int open_length = yytext[2] == '~' ? 3 : 2;
+										int open_column = yylloc->first_column;
+										yyless(open_length);
+										yylloc->first_line = yylloc->last_line = yylineno;
+										yylloc->last_column = open_column + open_length - 1;
+										yycolumn = open_column + open_length;
+										handlebars_yy_copy_lval();
+										return OPEN;
+                                    }
+
+<mu>"{{"{LEFT_STRIP}?{WHITESPACE}*"else"                {
 										// v2.0.0 handlebars.l line 76
 										handlebars_yy_copy_lval();
 										return OPEN_INVERSE_CHAIN;
@@ -481,3 +507,19 @@ BLOCKPARAM [\x7C]
 									}
 
 %%
+
+void handlebars_yy_reset(struct handlebars_parser * parser)
+{
+    yyscan_t yyscanner = parser->scanner;
+    struct yyguts_t * yyg = (struct yyguts_t *) yyscanner;
+
+    parser->tmplReadOffset = 0;
+    BEGIN(INITIAL);
+    yyg->yy_start_stack_ptr = 0;
+
+    if( YY_CURRENT_BUFFER != NULL ) {
+        yy_flush_buffer(YY_CURRENT_BUFFER, yyscanner);
+        yylineno = 1;
+        yycolumn = 0;
+    }
+}

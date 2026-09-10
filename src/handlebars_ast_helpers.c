@@ -49,7 +49,7 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_block(
     struct handlebars_locinfo * locinfo)
 {
     struct handlebars_ast_node * ast_node;
-    struct handlebars_ast_node * open_block_path = open_block->node.intermediate.path;
+    struct handlebars_ast_node * open_block_path;
     struct handlebars_ast_node * close_block_path;
     struct handlebars_ast_node * inverse = NULL;
     long inverse_strip = 0;
@@ -57,7 +57,10 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_block(
     struct handlebars_string * close_str;
     bool is_decorator = false;
 
-    assert(open_block != NULL && open_block->type == HANDLEBARS_AST_NODE_INTERMEDIATE);
+    if( unlikely(open_block == NULL || open_block->type != HANDLEBARS_AST_NODE_INTERMEDIATE) ) {
+        handlebars_throw_ex(CONTEXT, HANDLEBARS_PARSEERR, locinfo, "Invalid open block");
+    }
+    open_block_path = open_block->node.intermediate.path;
     assert(close == NULL || close->type == HANDLEBARS_AST_NODE_INTERMEDIATE || close->type == HANDLEBARS_AST_NODE_INVERSE);
 
     if( close && close->type == HANDLEBARS_AST_NODE_INTERMEDIATE ) {
@@ -84,8 +87,8 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_block(
     if( !program ) {
         program = handlebars_ast_node_ctor(HBSCTX(parser), HANDLEBARS_AST_NODE_PROGRAM);
     }
-    program->node.program.block_param1 = open_block->node.intermediate.block_param1;
-    program->node.program.block_param2 = open_block->node.intermediate.block_param2;
+    program->node.program.block_param1 = talloc_steal(program, open_block->node.intermediate.block_param1);
+    program->node.program.block_param2 = talloc_steal(program, open_block->node.intermediate.block_param2);
 
     if( inverse_and_program ) {
         assert(inverse_and_program->type == HANDLEBARS_AST_NODE_INVERSE);
@@ -130,6 +133,13 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_block(
     ast_node = handlebars_ast_node_ctor_block(parser, open_block, program, inverse,
                 open_block->strip, inverse_strip, close ? close->strip : 0, locinfo);
 
+    if( inverse_and_program ) {
+        handlebars_talloc_free(inverse_and_program);
+    }
+    if( close && close != inverse_and_program ) {
+        handlebars_talloc_free(close);
+    }
+
     ast_node->node.block.is_decorator = is_decorator;
     return ast_node;
 }
@@ -143,13 +153,13 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_inverse_chain(
     struct handlebars_ast_list * statements;
     struct handlebars_ast_node * program_node;
     struct handlebars_ast_node * ast_node;
+    unsigned strip = open_inverse_chain ? open_inverse_chain->strip : 0;
 
     block_node = handlebars_ast_helper_prepare_block(parser, open_inverse_chain, program, inverse_chain, inverse_chain, 0, locinfo);
     statements = handlebars_ast_list_ctor(HBSCTX(parser));
     handlebars_ast_list_append(statements, block_node);
     program_node = handlebars_ast_node_ctor_program(parser, statements, NULL, NULL, 0, 1, locinfo);
-    ast_node = handlebars_ast_node_ctor_inverse(parser, program_node, 1,
-                    (open_inverse_chain ? open_inverse_chain->strip : 0), locinfo);
+    ast_node = handlebars_ast_node_ctor_inverse(parser, program_node, 1, strip, locinfo);
 
     return ast_node;
 }
@@ -201,12 +211,15 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_partial_block(
     struct handlebars_ast_node * program, struct handlebars_ast_node * close,
     struct handlebars_locinfo * locinfo)
 {
-    struct handlebars_ast_node * open_block_path = open->node.intermediate.path;
+    struct handlebars_ast_node * open_block_path;
     struct handlebars_ast_node * close_block_path;
     struct handlebars_string * open_str;
     struct handlebars_string * close_str;
 
-    assert(open != NULL && open->type == HANDLEBARS_AST_NODE_INTERMEDIATE);
+    if( unlikely(open == NULL || open->type != HANDLEBARS_AST_NODE_INTERMEDIATE) ) {
+        handlebars_throw_ex(CONTEXT, HANDLEBARS_PARSEERR, locinfo, "Invalid partial block");
+    }
+    open_block_path = open->node.intermediate.path;
     assert(close == NULL || close->type == HANDLEBARS_AST_NODE_INTERMEDIATE || close->type == HANDLEBARS_AST_NODE_INVERSE);
 
     if( close && close->type == HANDLEBARS_AST_NODE_INTERMEDIATE ) {
@@ -239,6 +252,8 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_path(
     struct handlebars_string * part;
     struct handlebars_string * separator;
     struct handlebars_string * original;
+    struct handlebars_ast_node * path;
+    struct handlebars_ast_node * removed;
     bool is_literal;
     int depth = 0;
     int count = 0;
@@ -277,13 +292,17 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_path(
                 depth++;
             }
             // Instead of adding it below, remove it here
-            handlebars_ast_list_remove(parts, item->data);
+            removed = item->data;
+            handlebars_ast_list_remove(parts, removed);
+            handlebars_ast_node_dtor(removed);
         } else {
             count++;
         }
     }
 
-    return handlebars_ast_node_ctor_path(parser, parts, original, depth, data, locinfo);
+    path = handlebars_ast_node_ctor_path(parser, parts, original, depth, data, locinfo);
+    handlebars_talloc_free(original);
+    return path;
 }
 
 struct handlebars_ast_node * handlebars_ast_helper_prepare_raw_block(
@@ -322,7 +341,7 @@ struct handlebars_ast_node * handlebars_ast_helper_prepare_raw_block(
 
 static inline size_t handlebars_ast_helper_strip_comment_left(struct handlebars_string * comment)
 {
-    char * c = hbs_str_val(comment);
+    const char * c = hbs_str_val(comment);
     size_t start = 0;
 
     if( *c == '{' ) {
@@ -368,8 +387,8 @@ static inline size_t handlebars_ast_helper_strip_comment_left(struct handlebars_
 
 static inline size_t handlebars_ast_helper_strip_comment_right(struct handlebars_string * comment)
 {
-    char * orig = hbs_str_val(comment);
-    char * c = orig + hbs_str_len(comment);
+    const char * orig = hbs_str_val(comment);
+    const char * c = orig + hbs_str_len(comment);
     size_t len = hbs_str_len(comment);
 
     if( hbs_str_len(comment) < 2 ) {
@@ -416,7 +435,7 @@ struct handlebars_string * handlebars_ast_helper_strip_comment(struct handlebars
 struct handlebars_string * handlebars_ast_helper_strip_id_literal(struct handlebars_string * comment)
 {
     size_t len;
-    char * val;
+    const char * val;
 
     if (!comment) {
         return comment;
@@ -461,23 +480,68 @@ unsigned handlebars_ast_helper_strip_flags(struct handlebars_string * open, stru
     return strip;
 }
 
+static bool handlebars_ast_helper_legacy_scoped_id(
+    struct handlebars_string * original
+)
+{
+    const char * found;
+    char c;
+    size_t length = hbs_str_len(original);
+
+    if( length >= 1 && hbs_str_val(original)[0] == '.' ) {
+        return true;
+    }
+    if( length == 4 && memcmp(hbs_str_val(original), "this", 4) == 0 ) {
+        return true;
+    }
+    found = length > 4 ? strstr(hbs_str_val(original), "this") : NULL;
+    if( !found ) {
+        return false;
+    }
+    c = found[4];
+    return c < '0'
+        || (c > '9' && c < 'A')
+        || (c > 'Z' && c < '_')
+        || (c > '_' && c < 'a')
+        || c > 'z';
+}
+
 bool handlebars_ast_helper_scoped_id(struct handlebars_ast_node * path)
 {
     struct handlebars_string * original;
-    char * found;
-    if( path && (original = path->node.path.original) ) {
-        if( hbs_str_len(original) >= 1 && hbs_str_val(original)[0] == '.' ) {
-            return true;
-        } else if( hbs_str_len(original) == 4 && 0 == strcmp(hbs_str_val(original), "this") ) {
-            return true;
-        } else if( hbs_str_len(original) > 4 && NULL != (found = strstr(hbs_str_val(original), "this")) ) {
-        //} else if( len > 4 && 0 == strncmp(original, "this", 4) ) {
-            char c = *(found + 4);
-            // [^a-zA-Z0-9_]
-            return c < '0' || (c > '9' && c < 'A') || (c > 'Z' && c < '_') || (c > '_' && c < 'a') || c > 'z';
+    struct handlebars_ast_list_item * item;
+    struct handlebars_ast_list_item * tmp;
+    const char * value;
+    size_t length;
+
+    if( !path || !(original = path->node.path.original) ) {
+        return false;
+    }
+    // Data and bracket-literal paths retain their established opcode shape.
+    if( path->node.path.data ) {
+        return handlebars_ast_helper_legacy_scoped_id(original);
+    }
+    if( path->node.path.parts ) {
+        handlebars_ast_list_foreach(path->node.path.parts, item, tmp) {
+            if( item->data->node.path_segment.original
+                    && !handlebars_string_eq(
+                        item->data->node.path_segment.original,
+                        item->data->node.path_segment.part
+                    ) ) {
+                return handlebars_ast_helper_legacy_scoped_id(original);
+            }
         }
     }
-    return false;
+
+    value = hbs_str_val(original);
+    length = hbs_str_len(original);
+    if( length >= 1 && value[0] == '.' ) {
+        return true;
+    }
+    if( length < 4 || memcmp(value, "this", 4) != 0 ) {
+        return false;
+    }
+    return length == 4 || value[4] == '.' || value[4] == '/';
 }
 
 bool handlebars_ast_helper_simple_id(struct handlebars_ast_node * path)

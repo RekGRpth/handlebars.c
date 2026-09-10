@@ -21,8 +21,18 @@
 #include <assert.h>
 #include <string.h>
 
-#ifdef HAVE_ALLOCA_H
+#if defined(__cplusplus) || defined(__STDC_NO_VLA__) || defined(_MSC_VER)
+#if defined(__clang__) || defined(__GNUC__)
+#define HBS_VALUE_STACK_ALLOC(size) __builtin_alloca(size)
+#elif defined(_MSC_VER)
+#include <malloc.h>
+#define HBS_VALUE_STACK_ALLOC(size) _alloca(size)
+#elif defined(HAVE_ALLOCA_H)
 #include <alloca.h>
+#define HBS_VALUE_STACK_ALLOC(size) alloca(size)
+#else
+#error "handlebars_value.h requires compiler-supported stack allocation when VLAs are unavailable"
+#endif
 #endif
 
 #include "handlebars.h"
@@ -46,8 +56,13 @@ struct json_object;
 struct yaml_document_s;
 struct yaml_node_s;
 
+/** Maximum number of active containers in a recursive value traversal. */
+#define HANDLEBARS_VALUE_MAX_DEPTH 256
+
 /**
- * @brief Value iterator context. Should be stack allocated. Must be initialized with #handlebars_value_iterator_init
+ * @brief Value iterator context. Declare with
+ *        #HANDLEBARS_VALUE_ITERATOR_DECL and initialize with
+ *        #HANDLEBARS_VALUE_ITERATOR_INIT.
  */
 struct handlebars_value_iterator
 {
@@ -63,11 +78,25 @@ struct handlebars_value_iterator
     //! The current child element
     struct handlebars_value * cur;
 
-    //! Opaque pointer for user-defined types
+    //! Opaque backing-state pointer used by the iterator implementation
     void * usr;
+
+    //! Retained user-defined value owner, when applicable
+    struct handlebars_user * user;
 
     //! A function pointer to move to the next child element
     bool (*next)(struct handlebars_value_iterator * it);
+
+    //! A function pointer to release iterator-owned state
+    void (*close)(struct handlebars_value_iterator * it);
+
+    //! Opaque storage position used by native iterators
+    size_t position;
+
+    //! Internal error-unwind linkage
+    struct handlebars_value_iterator * unwind_next;
+    struct handlebars_value_iterator ** unwind_previous;
+    jmp_buf * unwind_target;
 };
 
 #ifndef HANDLEBARS_VALUE_SIZE
@@ -93,19 +122,27 @@ extern const size_t HANDLEBARS_VALUE_INTERNALS_SIZE;
 #define HANDLEBARS_VALUE_DECL_PRED(name) \
     struct handlebars_value mem_ ## name = {0}; \
     struct handlebars_value * const name HANDLEBARS_VALUE_DECL_CLEANUP = &mem_ ## name
-#elif !defined(__STDC_NO_VLA__)
+#elif !defined(__STDC_NO_VLA__) && !defined(__cplusplus) && !defined(_MSC_VER)
 // Use a char vla
 #define HANDLEBARS_VALUE_DECL_PRED(name) \
     char mem_ ## name[HANDLEBARS_VALUE_SIZE]; \
-    struct handlebars_value * const name HANDLEBARS_VALUE_DECL_CLEANUP = (void *) mem_ ## name; \
+    struct handlebars_value * const name HANDLEBARS_VALUE_DECL_CLEANUP = (struct handlebars_value *) mem_ ## name; \
     handlebars_value_init(name);
 #else
-// Use alloca
+// Use compiler-supported stack allocation; storage lasts until function return.
 #define HANDLEBARS_VALUE_DECL_PRED(name) \
-    struct handlebars_value * const name HANDLEBARS_VALUE_DECL_CLEANUP = alloca(HANDLEBARS_VALUE_SIZE); \
+    struct handlebars_value * const name HANDLEBARS_VALUE_DECL_CLEANUP = (struct handlebars_value *) HBS_VALUE_STACK_ALLOC(HANDLEBARS_VALUE_SIZE); \
     handlebars_value_init(name);
 #endif
 
+/**
+ * @def HANDLEBARS_VALUE_DECL
+ * @brief Declare automatic storage for one value.
+ *
+ * On C++, MSVC, and C implementations without VLAs, the storage is
+ * `alloca`-backed and is reclaimed when the containing function returns.
+ * Hoist declarations outside long-running loops in those builds.
+ */
 #if defined(HANDLEBARS_ENABLE_DEBUG)
 // The cleanup variable helps makes sure there is a matching pair of DECL/UNDECL
 #define HANDLEBARS_VALUE_DECL(name) \
@@ -123,22 +160,22 @@ extern const size_t HANDLEBARS_VALUE_INTERNALS_SIZE;
 // C does not support zero-length arrays, so reserve one slot for an empty logical array
 #define HANDLEBARS_VALUE_ARRAY_CAPACITY(num) ((num) > 0 ? (num) : 1)
 
-#if (defined(HANDLEBARS_VALUE_SIZE) && !defined(__STDC_NO_VLA__))
+#if (defined(HANDLEBARS_VALUE_SIZE) && !defined(__STDC_NO_VLA__) && !defined(__cplusplus) && !defined(_MSC_VER))
 // We know the size of value at compile-time, but we don't know if num is a constant, so we have be able to support VLA
 #define HANDLEBARS_VALUE_ARRAY_DECL_PRED(name, num) \
     struct handlebars_value name[HANDLEBARS_VALUE_ARRAY_CAPACITY(num)]; \
     memset(&name, 0, sizeof(name));
 #define HANDLEBARS_VALUE_ARRAY_AT(name, pos) (&name[pos])
-#elif !defined(__STDC_NO_VLA__)
+#elif !defined(__STDC_NO_VLA__) && !defined(__cplusplus) && !defined(_MSC_VER)
 // Use a char vla
 #define HANDLEBARS_VALUE_ARRAY_DECL_PRED(name, num) \
     char mem_ ## name[HANDLEBARS_VALUE_SIZE * HANDLEBARS_VALUE_ARRAY_CAPACITY(num)]; \
-    struct handlebars_value * name = (void *) &mem_ ## name; \
+    struct handlebars_value * name = (struct handlebars_value *) &mem_ ## name; \
     memset(name, 0, HANDLEBARS_VALUE_SIZE * HANDLEBARS_VALUE_ARRAY_CAPACITY(num));
 #else
-// Use alloca
+// Use compiler-supported stack allocation; storage lasts until function return.
 #define HANDLEBARS_VALUE_ARRAY_DECL_PRED(name, num) \
-    struct handlebars_value * name = alloca(HANDLEBARS_VALUE_SIZE * HANDLEBARS_VALUE_ARRAY_CAPACITY(num)); \
+    struct handlebars_value * name = (struct handlebars_value *) HBS_VALUE_STACK_ALLOC(HANDLEBARS_VALUE_SIZE * HANDLEBARS_VALUE_ARRAY_CAPACITY(num)); \
     memset(name, 0, HANDLEBARS_VALUE_SIZE * HANDLEBARS_VALUE_ARRAY_CAPACITY(num));
 #endif
 
@@ -153,6 +190,14 @@ extern const size_t HANDLEBARS_VALUE_INTERNALS_SIZE;
         } \
     } while (0)
 
+/**
+ * @def HANDLEBARS_VALUE_ARRAY_DECL
+ * @brief Declare automatic storage for an array of values.
+ *
+ * On C++, MSVC, and C implementations without VLAs, the storage is
+ * `alloca`-backed and is reclaimed when the containing function returns.
+ * Hoist declarations outside long-running loops in those builds.
+ */
 #if defined(HANDLEBARS_ENABLE_DEBUG)
 // The cleanup variable helps makes sure there is a matching pair of DECL/UNDECL
 #define HANDLEBARS_VALUE_ARRAY_DECL(name, num) \
@@ -186,11 +231,12 @@ extern const size_t HANDLEBARS_VALUE_INTERNALS_SIZE;
  */
 struct handlebars_value * handlebars_value_ctor(
     struct handlebars_context * ctx
-) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT HBS_ATTR_DEPRECATED;
 
 /**
- * @brief Destruct a value. Does not free the value object itself. Frees any child resources and sets the value to null.
- * @param[in] value
+ * @brief Destruct a value. Does not free the value object itself. Frees any
+ *        child resources, clears its payload flags, and sets the value to null.
+ * @param[in,out] value
  * @return void
  */
 void handlebars_value_dtor(
@@ -218,6 +264,15 @@ enum handlebars_value_type handlebars_value_get_type(struct handlebars_value * v
 enum handlebars_value_type handlebars_value_get_real_type(struct handlebars_value * value)
     HBS_ATTR_NONNULL_ALL;
 
+/**
+ * @brief Get the flags associated with the current payload
+ *
+ * Replacement mutators clear the previous payload's flags. Copying a value
+ * with #handlebars_value_value copies its flags along with its payload.
+ *
+ * @param[in] value The value to inspect
+ * @return The current payload flags
+ */
 unsigned char handlebars_value_get_flags(struct handlebars_value * value)
     HBS_ATTR_NONNULL_ALL;
 
@@ -231,6 +286,26 @@ const struct handlebars_value_handlers * handlebars_value_get_handlers(struct ha
 
 struct handlebars_map * handlebars_value_get_map(struct handlebars_value * value)
     HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Retrieve a borrowed pointer from a native pointer value.
+ *
+ * USER values whose effective type is PTR are not native pointer values. On a
+ * native-type or registered-type mismatch, #result is set to NULL. Retrieval
+ * does not transfer ownership; the pointee's lifetime follows the ownership
+ * policy of the contained pointer wrapper, including externally managed
+ * storage constructed with nofree=true.
+ *
+ * @param[in] value The value to inspect
+ * @param[in] typ The registered C type name
+ * @param[out] result The borrowed pointer, or NULL on failure
+ * @return true for a matching native pointer value, otherwise false
+ */
+bool handlebars_value_ptr_try_get(
+    struct handlebars_value * value,
+    const char * typ,
+    void ** result
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
 
 void * handlebars_value_get_ptr_ex(struct handlebars_value * value, const char * typ)
     HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
@@ -249,27 +324,39 @@ struct handlebars_closure * handlebars_value_get_closure(struct handlebars_value
     HBS_ATTR_NONNULL_ALL;
 
 /**
- * @brief Get the string value, or an empty string for non-string types
- * @param[in] value
- * @return The string value
+ * @brief Get the bytes of a native string value without conversion
+ * @param[in] value The value to inspect
+ * @return A borrowed pointer to the string bytes, or NULL when @p value is not
+ *         a native string value. Use #handlebars_value_get_strlen for the byte
+ *         length and #handlebars_value_to_string when conversion is required.
  */
 const char * handlebars_value_get_strval(
     struct handlebars_value * value
 ) HBS_ATTR_NONNULL_ALL;
 
 /**
- * @brief Get the string length, or zero for invalid types
- * @param[in] value
- * @return The string length
+ * @brief Get the byte length of a native string value without conversion
+ * @param[in] value The value to inspect
+ * @return The string byte length, or zero for non-string values
  */
 size_t handlebars_value_get_strlen(
     struct handlebars_value * value
 ) HBS_ATTR_NONNULL_ALL;
 
 /**
- * @brief Get the boolean value. Follows javascript boolean conversion rules.
- * @param[in] value
- * @return The boolean value
+ * @brief Get the value's truthiness using the library's emptiness rules
+ *
+ * Null, false, numeric zero, empty native containers, empty strings, the
+ * one-byte string "0", and user values with a zero count are false. True,
+ * nonzero numbers, other nonempty strings and containers, and NaN are true.
+ * Other value types are false. These rules intentionally differ from
+ * JavaScript boolean conversion.
+ *
+ * @pre A USER value must provide a non-NULL count handler; this getter invokes
+ *      it to determine truthiness.
+ *
+ * @param[in] value The value to inspect
+ * @return The value's library-specific truthiness
  */
 bool handlebars_value_get_boolval(
     struct handlebars_value * value
@@ -300,7 +387,10 @@ double handlebars_value_get_floatval(
 /**
  * @brief Get the value as a string (primitive types only)
  * @param[in] value The handlebars value
- * @return The value as a string
+ * @param[in] context The handlebars memory context used for converted values
+ * @return A retained or newly allocated string. The caller must always release
+ *         it with #handlebars_string_delref. Its talloc lifetime is bounded by
+ *         the existing string owner or @p context, respectively.
  */
 struct handlebars_string * handlebars_value_to_string(
     struct handlebars_value * value,
@@ -308,7 +398,9 @@ struct handlebars_string * handlebars_value_to_string(
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL;
 
 /**
- * @brief Convert a value to string, following handlebars (javascript) string conversion rules
+ * @brief Convert a value to string, following handlebars (javascript) string conversion rules.
+ *        Cyclic graphs and container nesting beyond #HANDLEBARS_VALUE_MAX_DEPTH
+ *        raise an error.
  * @param[in] context The handlebars memory context
  * @param[in] value The value to convert
  * @param[in] escape Whether or not to escape the value. Overridden by #HANDLEBARS_VALUE_FLAG_SAFE_STRING
@@ -322,7 +414,8 @@ struct handlebars_string * handlebars_value_expression(
 
 /**
  * @brief Convert a value to string and append to the given buffer, following handlebars (javascript)
- *        string conversion rules.
+ *        string conversion rules. Cyclic graphs and container nesting beyond
+ *        #HANDLEBARS_VALUE_MAX_DEPTH raise an error.
  * @param[in] context The handlebars memory context
  * @param[in] value The value to convert
  * @param[in] string The buffer to which the result will be appended
@@ -337,7 +430,10 @@ struct handlebars_string * handlebars_value_expression_append(
 ) HBS_ATTR_NONNULL_ALL HBS_ATTR_RETURNS_NONNULL HBS_ATTR_WARN_UNUSED_RESULT;
 
 /**
- * @brief Convert a value from a user-defined type to an internal type
+ * @brief Convert a value from a user-defined type to an internal type. Native
+ *        cyclic graphs and container nesting beyond
+ *        #HANDLEBARS_VALUE_MAX_DEPTH raise an error. User-defined conversion
+ *        handlers remain responsible for bounding their own internal traversal.
  * @param[in] value
  * @param[in] recurse
  * @return void
@@ -347,7 +443,7 @@ void handlebars_value_convert_ex(
     bool recurse
 ) HBS_ATTR_NONNULL_ALL;
 
-#define handlebars_value_convert(value) handlebars_value_convert_ex(value, 1);
+#define handlebars_value_convert(value) handlebars_value_convert_ex((value), true)
 
 bool handlebars_value_eq(
     struct handlebars_value * value1,
@@ -359,8 +455,8 @@ bool handlebars_value_eq(
 // {{{ Mutators
 
 /**
- * @brief Set the value to null
- * @param[in] value
+ * @brief Set the value to null and clear its payload flags
+ * @param[in,out] value
  * @return void
  */
 void handlebars_value_null(struct handlebars_value * value) HBS_ATTR_NONNULL_ALL;
@@ -409,8 +505,22 @@ void handlebars_value_helper(struct handlebars_value * value, handlebars_helper_
 
 void handlebars_value_closure(struct handlebars_value * value, struct handlebars_closure * closure) HBS_ATTR_NONNULL_ALL;
 
+/**
+ * @brief Replace a value with a copy of another value, including its flags
+ * @param[in,out] dest The value to replace
+ * @param[in] src The value and payload flags to copy
+ */
 void handlebars_value_value(struct handlebars_value * dest, struct handlebars_value * src) HBS_ATTR_NONNULL_ALL;
 
+/**
+ * @brief Set a flag on the current payload
+ *
+ * Assign payload flags after constructing the payload. A subsequent value
+ * replacement or destruction clears them.
+ *
+ * @param[in,out] value The value whose current payload receives the flag
+ * @param[in] flag The flag to set
+ */
 void handlebars_value_set_flag(struct handlebars_value * value, enum handlebars_value_flags flag)
     HBS_ATTR_NONNULL_ALL;
 
@@ -426,9 +536,9 @@ void handlebars_value_set_flag(struct handlebars_value * value, enum handlebars_
 bool handlebars_value_is_callable(struct handlebars_value * value) HBS_ATTR_NONNULL_ALL;
 
 /**
- * @brief Check if the value is empty. Follows javascript boolean conversion rules.
- * @param[in] value
- * @return Whether or not the value is empty
+ * @brief Check whether the value is empty under the library's truthiness rules
+ * @param[in] value The value to inspect
+ * @return The inverse of #handlebars_value_get_boolval
  */
 bool handlebars_value_is_empty(struct handlebars_value * value) HBS_ATTR_NONNULL_ALL;
 
@@ -450,16 +560,75 @@ long handlebars_value_count(struct handlebars_value * value) HBS_ATTR_NONNULL_AL
 
 // {{{ Array
 
+/**
+ * @brief Replace an element in a native stack-backed array.
+ *
+ * This legacy entry point aborts when #value is not a native array and may
+ * propagate allocation or bounds failures through `longjmp`. USER values whose
+ * effective type is ARRAY are read-only through this interface.
+ *
+ * @param[in,out] value The native array to update
+ * @param[in] index The element index, or the current count to append
+ * @param[in] child The replacement value
+ */
 void handlebars_value_array_set(
     struct handlebars_value * value,
     size_t index,
     struct handlebars_value * child
 ) HBS_ATTR_NONNULL_ALL;
 
+/**
+ * @brief Replace an element without allowing an internal `longjmp` to escape.
+ *
+ * Returns #HANDLEBARS_TYPE_ERROR without changing #value when it is not a
+ * native stack-backed array. USER values whose effective type is ARRAY are not
+ * mutable through this interface. A type error does not change any context's
+ * error state; captured native-container errors remain available from the
+ * container's allocation context.
+ *
+ * @param[in,out] value The native array to update
+ * @param[in] index The element index, or the current count to append
+ * @param[in] child The replacement value
+ * @return #HANDLEBARS_SUCCESS or the captured error code
+ */
+enum handlebars_error_type handlebars_value_array_set_try(
+    struct handlebars_value * value,
+    size_t index,
+    struct handlebars_value * child
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
+
+/**
+ * @brief Append an element to a native stack-backed array.
+ *
+ * This legacy entry point aborts when #value is not a native array and may
+ * propagate allocation failures through `longjmp`. USER values whose effective
+ * type is ARRAY are read-only through this interface.
+ *
+ * @param[in,out] value The native array to update
+ * @param[in] child The value to append
+ */
 void handlebars_value_array_push(
     struct handlebars_value * value,
     struct handlebars_value * child
 ) HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Append an element without allowing an internal `longjmp` to escape.
+ *
+ * Returns #HANDLEBARS_TYPE_ERROR without changing #value when it is not a
+ * native stack-backed array. USER values whose effective type is ARRAY are not
+ * mutable through this interface. A type error does not change any context's
+ * error state; captured native-container errors remain available from the
+ * container's allocation context.
+ *
+ * @param[in,out] value The native array to update
+ * @param[in] child The value to append
+ * @return #HANDLEBARS_SUCCESS or the captured error code
+ */
+enum handlebars_error_type handlebars_value_array_push_try(
+    struct handlebars_value * value,
+    struct handlebars_value * child
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
 
 /**
  * @brief Lookup an index in an array
@@ -490,16 +659,51 @@ struct handlebars_value * handlebars_value_map_str_find(
     struct handlebars_value * rv
 ) HBS_ATTR_NONNULL_ALL;
 
+/**
+ * @brief Update a native map.
+ *
+ * This legacy entry point aborts when #value is not a native map and may
+ * propagate allocation failures through `longjmp`. USER values whose effective
+ * type is MAP are read-only through this interface.
+ *
+ * @param[in,out] value The native map to update
+ * @param[in] key The key to update or add
+ * @param[in] child The value to store
+ */
 void handlebars_value_map_update(
     struct handlebars_value * value,
     struct handlebars_string * key,
     struct handlebars_value * child
 ) HBS_ATTR_NONNULL_ALL;
 
+/**
+ * @brief Update a native map without allowing an internal `longjmp` to escape.
+ *
+ * Returns #HANDLEBARS_TYPE_ERROR without changing #value when it is not a
+ * native map. USER values whose effective type is MAP are read-only through
+ * this interface. A type error does not change any context's error state;
+ * captured native-container errors remain available from the container's
+ * allocation context.
+ *
+ * @param[in,out] value The native map to update
+ * @param[in] key The key to update or add
+ * @param[in] child The value to store
+ * @return #HANDLEBARS_SUCCESS or the captured error code
+ */
+enum handlebars_error_type handlebars_value_map_update_try(
+    struct handlebars_value * value,
+    struct handlebars_string * key,
+    struct handlebars_value * child
+) HBS_ATTR_NONNULL_ALL HBS_ATTR_WARN_UNUSED_RESULT;
+
 // }}} Map
 
 // {{{ Misc
 
+/**
+ * @brief Return a diagnostic representation of a value. Cyclic graphs and
+ *        container nesting beyond #HANDLEBARS_VALUE_MAX_DEPTH raise an error.
+ */
 char * handlebars_value_dump(
     struct handlebars_value * value,
     struct handlebars_context * context,
@@ -532,33 +736,85 @@ const char * handlebars_value_type_readable(enum handlebars_value_type type)
 
 // {{{ Iteration
 
+#if defined(HBS_HAVE_ATTR_CLEANUP)
+#define HANDLEBARS_VALUE_ITERATOR_DECL_CLEANUP HBS_ATTR_CLEANUP(handlebars_value_iterator_cleanup)
+#else
+#define HANDLEBARS_VALUE_ITERATOR_DECL_CLEANUP
+#endif
+
+/**
+ * @brief Declare a value iterator and its private current-value storage.
+ *
+ * On C++, MSVC, and C implementations without VLAs, this uses `alloca`-style
+ * storage that is reclaimed when the containing function returns. Repeated
+ * declarations in a long-running loop therefore accumulate stack storage;
+ * hoist the declaration outside such loops and close the iterator before
+ * reinitializing it.
+ *
+ * @param name A bare C identifier used by #HANDLEBARS_VALUE_ITERATOR_INIT.
+ */
 #if defined(HANDLEBARS_VALUE_ITERATOR_SIZE) && defined(HANDLEBARS_VALUE_SIZE)
 // We know the size at compile-time
 #define HANDLEBARS_VALUE_ITERATOR_DECL(name) \
-    struct { struct handlebars_value_iterator it; struct handlebars_value value; } mem_ ## name; \
-    struct handlebars_value_iterator * name = (void *) &mem_ ## name
-#elif !defined(__STDC_NO_VLA__)
+    struct { struct handlebars_value_iterator it; struct handlebars_value value; } mem_ ## name = {0}; \
+    struct handlebars_value_iterator * const name HANDLEBARS_VALUE_ITERATOR_DECL_CLEANUP = &mem_ ## name.it; \
+    struct handlebars_value * const hbs_value_iterator_current_ ## name = &mem_ ## name.value
+#elif !defined(__STDC_NO_VLA__) && !defined(__cplusplus) && !defined(_MSC_VER)
 // Use a char vla
 #define HANDLEBARS_VALUE_ITERATOR_DECL(name) \
     char mem_ ## name[HANDLEBARS_VALUE_ITERATOR_SIZE + HANDLEBARS_VALUE_SIZE]; \
-    struct handlebars_value_iterator * name = (void *) mem_ ## name;
+    struct handlebars_value_iterator * const name HANDLEBARS_VALUE_ITERATOR_DECL_CLEANUP = (struct handlebars_value_iterator *) mem_ ## name; \
+    struct handlebars_value * const hbs_value_iterator_current_ ## name = (struct handlebars_value *) (mem_ ## name + HANDLEBARS_VALUE_ITERATOR_SIZE); \
+    memset(mem_ ## name, 0, sizeof(mem_ ## name))
 #else
-// Use alloca
+// Use compiler-supported stack allocation; storage lasts until function return.
 #define HANDLEBARS_VALUE_ITERATOR_DECL(name) \
-    struct handlebars_value_iterator * name = alloca(HANDLEBARS_VALUE_ITERATOR_SIZE + HANDLEBARS_VALUE_SIZE);
+    struct handlebars_value_iterator * const name HANDLEBARS_VALUE_ITERATOR_DECL_CLEANUP = (struct handlebars_value_iterator *) HBS_VALUE_STACK_ALLOC(HANDLEBARS_VALUE_ITERATOR_SIZE + HANDLEBARS_VALUE_SIZE); \
+    struct handlebars_value * const hbs_value_iterator_current_ ## name = (struct handlebars_value *) (((char *) name) + HANDLEBARS_VALUE_ITERATOR_SIZE); \
+    memset(name, 0, HANDLEBARS_VALUE_ITERATOR_SIZE + HANDLEBARS_VALUE_SIZE)
 #endif
+
+#define HBS_VALUE_ITERATOR_CURRENT(name) hbs_value_iterator_current_ ## name
+
+/**
+ * @brief Initialize an iterator declared with
+ *        #HANDLEBARS_VALUE_ITERATOR_DECL. An initialized iterator retains its
+ *        backing storage and may outlive the source value, but not the backing
+ *        storage's talloc parent. It must be advanced to completion or closed
+ *        with #handlebars_value_iterator_close.
+ * @param name The bare identifier passed to
+ *             #HANDLEBARS_VALUE_ITERATOR_DECL.
+ * @param value The value for iteration.
+ * @return true, or false if the value is empty or of an invalid type.
+ */
+#define HANDLEBARS_VALUE_ITERATOR_INIT(name, value) \
+    handlebars_value_iterator_init_internal( \
+        name, \
+        HBS_VALUE_ITERATOR_CURRENT(name), \
+        value \
+    )
+
+/**
+ * @name Value iteration
+ *
+ * On the `alloca` fallback described by #HANDLEBARS_VALUE_ITERATOR_DECL, each
+ * foreach invocation inside an enclosing loop retains its declaration storage
+ * until the containing function returns. Use an explicitly hoisted iterator
+ * for long-running loops in those builds.
+ * @{
+ */
 
 #define HANDLEBARS_VALUE_FOREACH(value, v) \
     do { \
         HANDLEBARS_VALUE_ITERATOR_DECL(iter); \
-        if (handlebars_value_iterator_init(iter, value)) { \
+        if (HANDLEBARS_VALUE_ITERATOR_INIT(iter, value)) { \
             do { \
                 struct handlebars_value * v = iter->cur; \
 
 #define HANDLEBARS_VALUE_FOREACH_IDX(value, idx, v) \
     do { \
         HANDLEBARS_VALUE_ITERATOR_DECL(iter); \
-        if (handlebars_value_iterator_init(iter, value)) { \
+        if (HANDLEBARS_VALUE_ITERATOR_INIT(iter, value)) { \
             do { \
                 size_t idx = iter->index; \
                 struct handlebars_value * v = iter->cur;
@@ -566,7 +822,7 @@ const char * handlebars_value_type_readable(enum handlebars_value_type type)
 #define HANDLEBARS_VALUE_FOREACH_KV(value, k, v) \
     do { \
         HANDLEBARS_VALUE_ITERATOR_DECL(iter); \
-        if (handlebars_value_iterator_init(iter, value)) { \
+        if (HANDLEBARS_VALUE_ITERATOR_INIT(iter, value)) { \
             do { \
                 struct handlebars_string * k = iter->key; \
                 struct handlebars_value * v = iter->cur;
@@ -574,7 +830,7 @@ const char * handlebars_value_type_readable(enum handlebars_value_type type)
 #define HANDLEBARS_VALUE_FOREACH_IDX_KV(value, idx, k, v) \
     do { \
         HANDLEBARS_VALUE_ITERATOR_DECL(iter); \
-        if (handlebars_value_iterator_init(iter, value)) { \
+        if (HANDLEBARS_VALUE_ITERATOR_INIT(iter, value)) { \
             do { \
                 size_t idx = iter->index; \
                 struct handlebars_string * k = iter->key; \
@@ -583,22 +839,51 @@ const char * handlebars_value_type_readable(enum handlebars_value_type type)
 #define HANDLEBARS_VALUE_FOREACH_END() \
             } while (handlebars_value_iterator_next(iter)); \
         } \
+        handlebars_value_iterator_close(iter); \
     } while(0)
 
+/** @} */
+
 /**
- * @brief Initialize an iterator
- * @param[in] it The iterator to initialize
- * @param[in] value The value for iteration
- * @return true, or false if the value is empty or of an invalid type
+ * @internal Backend for #HANDLEBARS_VALUE_ITERATOR_INIT. This symbol is
+ *           exported only so the public macro can call it from downstream
+ *           translation units. Callers must use the declaration and
+ *           initialization macros instead.
+ * @param[in,out] it Exact-size iterator storage
+ * @param[in,out] current Uninitialized storage of at least
+ *                        `HANDLEBARS_VALUE_SIZE` bytes that overlaps neither
+ *                        @p it nor @p value; initialized by this function and
+ *                        managed by @p it until it is closed
+ * @param[in] value The value to iterate
+ * @return true, or false if @p value is empty or not iterable
  */
-bool handlebars_value_iterator_init(
+bool handlebars_value_iterator_init_internal(
     struct handlebars_value_iterator * it,
+    struct handlebars_value * current,
     struct handlebars_value * value
 ) HBS_ATTR_NONNULL_ALL;
 
 bool handlebars_value_iterator_next(
     struct handlebars_value_iterator * it
 ) HBS_ATTR_NONNULL_ALL;
+
+/**
+ * @brief Release iterator-owned state. Safe to call more than once after the
+ *        iterator has been zero initialized or passed to
+ *        #HANDLEBARS_VALUE_ITERATOR_INIT. Manually initialized iterators that
+ *        are not advanced to completion must be closed explicitly. The foreach
+ *        macros close their iterator, and supported compilers also arrange
+ *        scope cleanup for iterators declared with
+ *        #HANDLEBARS_VALUE_ITERATOR_DECL.
+ * @param[in] it The initialized or zero-initialized iterator to close
+ */
+void handlebars_value_iterator_close(
+    struct handlebars_value_iterator * it
+) HBS_ATTR_NONNULL_ALL;
+
+void handlebars_value_iterator_cleanup(
+    struct handlebars_value_iterator * const * it
+);
 
 // }}} Iteration
 

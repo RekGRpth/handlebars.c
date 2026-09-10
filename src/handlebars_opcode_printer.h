@@ -31,6 +31,7 @@ HBS_EXTERN_C_START
 struct handlebars_opcode;
 struct handlebars_operand;
 struct handlebars_compiler;
+struct handlebars_program;
 
 /**
  * @brief Flags to control opcode printer behaviour
@@ -42,7 +43,7 @@ enum handlebars_opcode_printer_flag {
     handlebars_opcode_printer_flag_none = 0,
 
     /**
-     * @brief Join with spaces instead of newlines
+     * @brief Join program entries with spaces instead of newlines
      */
     handlebars_opcode_printer_flag_no_newlines = (1 << 0),
 

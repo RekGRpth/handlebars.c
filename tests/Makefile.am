@@ -13,7 +13,27 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-EXTRA_DIST = utils.h fixture1.hbs fixture1.json fixture1.yaml fixture2.hbs fixture3.hbs fixture4.hbs test_executable.bats
+EXTRA_DIST = \
+	CMakeLists.txt \
+	installed_config/CMakeLists.txt \
+	installed_config/main.c \
+	installed_config/target.c \
+	installed_config/run.cmake \
+	header_compile_probe.c \
+	helper_data.json \
+	helper_executable.sh \
+	helper_executable_alt.sh \
+	test_executable.bats \
+	test_headers.sh \
+	test_spec_runners.sh \
+	test_value_api.cpp \
+	utils.h \
+	fixture1.hbs \
+	fixture1.json \
+	fixture1.yaml \
+	fixture2.hbs \
+	fixture3.hbs \
+	fixture4.hbs
 AM_CPPFLAGS = $(CODE_COVERAGE_CPPFLAGS) -I$(top_builddir)/src -I$(top_srcdir)/src
 AM_CFLAGS = $(WARN_CFLAGS) $(HARDENING_BIN_CFLAGS) $(CODE_COVERAGE_CFLAGS) $(FUZZING_CFLAGS) $(JSON_CFLAGS) $(LMDB_CFLAGS) $(PTHREAD_CFLAGS) $(TALLOC_CFLAGS) $(YAML_CFLAGS) $(CHECK_CFLAGS) $(PCRE_CFLAGS) $(SUBUNIT_CFLAGS)
 AM_LDFLAGS = $(WARN_LDFLAGS) $(HARDENING_BIN_LDFLAGS) $(CODE_COVERAGE_LIBS) $(FUZZING_LDFLAGS) -static # for valgrind
@@ -37,7 +57,8 @@ check_PROGRAMS = \
 	test_stack \
 	test_string \
 	test_token \
-	test_value
+	test_value \
+	test_value_api
 
 COMMONFILES = utils.h utils.c fixtures.c adler32.c
 
@@ -52,6 +73,7 @@ test_stack_SOURCES = $(COMMONFILES) test_stack.c
 test_string_SOURCES = $(COMMONFILES) test_string.c
 test_token_SOURCES = $(COMMONFILES) test_token.c
 test_value_SOURCES = $(COMMONFILES) test_value.c
+test_value_api_SOURCES = test_value_api.c
 
 if TESTING_EXPORTS
 test_ast_helpers_SOURCES = $(COMMONFILES) test_ast_helpers.c
@@ -96,7 +118,12 @@ test_random_alloc_fail_SOURCES = $(COMMONFILES) test_random_alloc_fail.c
 check_PROGRAMS += test_random_alloc_fail
 endif
 
-TESTS = $(check_PROGRAMS)
+TESTS = $(check_PROGRAMS) test_headers.sh
+if JSON
+TESTS += test_spec_runners.sh
+endif
+TEST_EXTENSIONS = @EXEEXT@ .test .sh
+SH_LOG_COMPILER = $(SHELL)
 AM_TESTS_ENVIRONMENT = \
 	top_srcdir=$(top_srcdir) \
 	top_builddir=$(top_builddir) \
@@ -108,7 +135,20 @@ AM_TESTS_ENVIRONMENT = \
 	CK_VERBOSITY=normal \
 	HANDLEBARSC=$(top_builddir)/bin/handlebarsc \
 	TEST_DIR=$(top_srcdir)/tests \
-	BENCH_DIR=$(top_srcdir)/bench
+	SPEC_COMPILER='$(abs_builddir)/test_spec_handlebars_compiler$(EXEEXT)' \
+	SPEC_PARSER='$(abs_builddir)/test_spec_handlebars_parser$(EXEEXT)' \
+	SPEC_TOKENIZER='$(abs_builddir)/test_spec_handlebars_tokenizer$(EXEEXT)' \
+	SPEC_RUNTIME='$(abs_builddir)/test_spec_handlebars$(EXEEXT)' \
+	SPEC_RUNTIME_SOURCE='$(HANDLEBARS_SPEC_DIR)/spec' \
+	BENCH_DIR=$(top_srcdir)/bench \
+	HEADER_SOURCE_DIR=$(top_srcdir)/src \
+	HEADER_BUILD_DIR=$(top_builddir)/src \
+	HEADER_PROBE=$(top_srcdir)/tests/header_compile_probe.c \
+	HEADER_CC='$(CC)' \
+	HEADER_CXX='$(CXX)' \
+	HEADER_CPPFLAGS='$(CPPFLAGS) $(TALLOC_CFLAGS)' \
+	HEADER_CFLAGS='$(CFLAGS)' \
+	HEADER_CXXFLAGS='$(CXXFLAGS)'
 
 if BATS
 TESTS += test_executable.bats

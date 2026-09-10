@@ -24,16 +24,13 @@ set(SOURCE_FILES
     handlebars_ast_list.c
     handlebars_ast_printer.c
     handlebars_cache.c
-    handlebars_cache_lmdb.c
     handlebars_cache_mmap.c
     handlebars_cache_simple.c
     handlebars_closure.c
     handlebars_compiler.c
     handlebars_delimiters.c
     handlebars_helpers.c
-    handlebars_json.c
     handlebars_map.c
-    # handlebars_memory.c
     handlebars_module_printer.c
     handlebars_opcode_printer.c
     handlebars_opcode_serializer.c
@@ -50,8 +47,23 @@ set(SOURCE_FILES
     handlebars_value.c
     handlebars_value_handlers.c
     handlebars_vm.c
-    handlebars_whitespace.c
-    handlebars_yaml.c)
+    handlebars_whitespace.c)
+
+if(Libjsonc_FOUND)
+    list(APPEND SOURCE_FILES handlebars_json.c)
+endif()
+
+if(LMDB_FOUND)
+    list(APPEND SOURCE_FILES handlebars_cache_lmdb.c)
+endif()
+
+if(LibYaml_FOUND)
+    list(APPEND SOURCE_FILES handlebars_yaml.c)
+endif()
+
+if(HANDLEBARS_ENABLE_MEMORY)
+    list(APPEND SOURCE_FILES handlebars_memory.c)
+endif()
 
 set(HEADERS
     ${CMAKE_CURRENT_BINARY_DIR}/handlebars_config.h
@@ -95,10 +107,18 @@ set(HEADERS
 # handlebars_whitespace.h
 # handlebars_value_private.h
 
-link_libraries(${LIBS})
-
 add_library(handlebars SHARED ${SOURCE_FILES} ${HEADERS})
 add_library(handlebars_static STATIC ${SOURCE_FILES} ${HEADERS})
+set_target_properties(handlebars PROPERTIES SOVERSION 10)
+
+foreach(library handlebars handlebars_static)
+    target_include_directories(${library} PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>"
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
+        "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/handlebars>"
+        ${TALLOC_INCLUDE_DIRS})
+    target_link_libraries(${library} PUBLIC ${LIBS})
+endforeach()
 
 install(TARGETS handlebars handlebars_static
     EXPORT handlebars
